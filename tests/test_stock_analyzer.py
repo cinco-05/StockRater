@@ -2,7 +2,7 @@ import json
 
 import pandas as pd
 
-import stock_analyzer_v6 as analyzer
+import stock_analyzer as analyzer
 
 
 def test_self_test_passes():

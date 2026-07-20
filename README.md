@@ -62,16 +62,16 @@ python stock_analyzer.py --self-test
 python stock_analyzer.py --help
 ```
 
-## Improved V6
-
-`stock_analyzer_v6.py` is the recommended version. It adds explicit reverse-DCF bounds, strict benchmark matching in backtests, a versioned self-healing cache, validated model configuration, improved error diagnostics, automated regression tests, and GitHub Actions CI.
+The analyzer includes explicit reverse-DCF bounds, strict benchmark matching in backtests, a versioned self-healing cache, validated model configuration, and detailed diagnostics.
 
 ```bash
-python stock_analyzer_v6.py --ticker AAPL
-python stock_analyzer_v6.py --ticker AAPL --debug
-python stock_analyzer_v6.py --config-json model_config.example.json --ticker AAPL
-python stock_analyzer_v6.py --self-test
+python stock_analyzer.py --ticker AAPL --debug
+python stock_analyzer.py --config-json examples/model_config.json --ticker AAPL
 ```
+
+Running the script without `--ticker` starts an interactive prompt.
+
+## Development
 
 Install development dependencies and run the regression suite with:
 
@@ -80,9 +80,7 @@ python -m pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 
-Copy `model_config.example.json` before editing model assumptions. V6 validates supported keys, numeric ranges, family weights, and sector-profile shapes before analysis begins.
-
-Running the script without `--ticker` starts an interactive prompt.
+Copy `examples/model_config.json` before editing model assumptions. The analyzer validates supported keys, numeric ranges, family weights, and sector-profile shapes before analysis begins.
 
 ## Backtesting
 
@@ -104,12 +102,12 @@ Use `--calibrate-out weights.json` with a backtest to generate candidate categor
 
 Live data is provided through `yfinance`. Responses are cached in the operating system's temporary directory for six hours by default. Use `--no-cache` to bypass the cache or `--clear-cache` to remove it.
 
-The following environment variables customize V5 cache behavior:
+The following environment variables customize cache behavior:
 
-- `SAV5_CACHE`: cache directory
-- `SAV5_CACHE_TTL`: cache lifetime in seconds
+- `SAV6_CACHE`: cache directory
+- `SAV6_CACHE_TTL`: cache lifetime in seconds
 
-V6 uses the corresponding `SAV6_CACHE` and `SAV6_CACHE_TTL` variables and automatically invalidates incompatible cache schemas.
+Incompatible or corrupt cache entries are automatically invalidated.
 
 ## License
 

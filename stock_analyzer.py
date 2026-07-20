@@ -1,6 +1,7 @@
-"""Fundamental equity valuation model V5.
+"""Fundamental equity valuation model V6.
 
-Rebuilt from V4 with a focus on valuation correctness rather than feature count.
+Evolved from V5 with stricter backtesting, explicit reverse-DCF bounds,
+versioned caches, auditable configuration, and stronger diagnostics.
 The headline output is a per-share economic fair value, a margin-of-safety
 adjusted BUY-BELOW price, and an over/undervaluation verdict.
 
@@ -45,8 +46,8 @@ Run:
     python stock_analyzer.py --ticker AAPL
     python stock_analyzer.py --ticker AAPL --peers MSFT,GOOGL --detail detailed
     python stock_analyzer.py --ticker AAPL --json
-    python stock_analyzer.py --ticker AAPL --mos 0.30      # demand a 30% discount
-    python stock_analyzer.py --self-test                   # no network required
+    python stock_analyzer.py --mos 0.30 --ticker AAPL
+    python stock_analyzer.py --self-test
     python stock_analyzer.py --backtest-csv history.csv
 
 Educational quantitative screen. Not investment advice.
@@ -67,6 +68,7 @@ import sys
 import tempfile
 import textwrap
 import time
+import traceback
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -111,9 +113,11 @@ MIN_CATEGORY_COVERAGE = 0.40
 MAX_FAMILY_RATIO = 3.0               # across-family high/low above this -> no point estimate
 MAX_TERMINAL_SHARE = 0.80            # terminal value share of EV above this -> flagged
 
-CACHE_DIR = Path(os.environ.get("SAV5_CACHE", Path(tempfile.gettempdir()) / "stock_analyzer_v5"))
-CACHE_TTL_SECONDS = int(os.environ.get("SAV5_CACHE_TTL", 6 * 60 * 60))
+CACHE_SCHEMA_VERSION = 2
+CACHE_DIR = Path(os.environ.get("SAV6_CACHE", Path(tempfile.gettempdir()) / "stock_analyzer_v6"))
+CACHE_TTL_SECONDS = int(os.environ.get("SAV6_CACHE_TTL", 6 * 60 * 60))
 CACHE_ENABLED = True
+DEBUG_MODE = False
 
 CATEGORY_MAXIMUMS = {
     "profitability": 20.0,
@@ -156,6 +160,86 @@ SECTOR_PROFILES: dict[str, dict[str, float]] = {
 
 class StockDataError(RuntimeError):
     """Raised when no defensible analysis can be produced for a symbol."""
+
+
+class ConfigurationError(ValueError):
+    """Raised when a model configuration file is unsafe or invalid."""
+
+
+CONFIGURABLE_DEFAULTS: dict[str, float | int] = {
+    "default_risk_free": DEFAULT_RISK_FREE,
+    "equity_risk_premium": EQUITY_RISK_PREMIUM,
+    "min_cost_of_equity": MIN_COST_OF_EQUITY,
+    "max_cost_of_equity": MAX_COST_OF_EQUITY,
+    "min_wacc": MIN_WACC,
+    "max_wacc": MAX_WACC,
+    "terminal_spread_to_rf": TERMINAL_SPREAD_TO_RF,
+    "min_terminal_growth": MIN_TERMINAL_GROWTH,
+    "max_terminal_growth": MAX_TERMINAL_GROWTH,
+    "explicit_years": EXPLICIT_YEARS,
+    "fade_years": FADE_YEARS,
+    "statutory_tax_fallback": STATUTORY_TAX_FALLBACK,
+    "max_family_ratio": MAX_FAMILY_RATIO,
+    "max_terminal_share": MAX_TERMINAL_SHARE,
+}
+
+CONFIG_GLOBALS = {key: key.upper() for key in CONFIGURABLE_DEFAULTS}
+
+
+def load_model_config(path: Optional[str]) -> None:
+    """Apply a small, validated JSON override set to documented model defaults."""
+    if not path:
+        return
+    source = Path(path)
+    try:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigurationError(f"Could not read model configuration: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ConfigurationError("Model configuration must be a JSON object.")
+    unknown = set(payload) - {"model", "family_weights", "sector_profiles"}
+    if unknown:
+        raise ConfigurationError("Unknown configuration section(s): " + ", ".join(sorted(unknown)))
+    model = payload.get("model", {})
+    if not isinstance(model, dict):
+        raise ConfigurationError("The 'model' section must be an object.")
+    unknown_model = set(model) - set(CONFIGURABLE_DEFAULTS)
+    if unknown_model:
+        raise ConfigurationError("Unknown model setting(s): " + ", ".join(sorted(unknown_model)))
+    for key, value in model.items():
+        number = safe_number(value)
+        if number is None:
+            raise ConfigurationError(f"Model setting '{key}' must be finite and numeric.")
+        if key in {"explicit_years", "fade_years"}:
+            number = int(number)
+            if number < 1:
+                raise ConfigurationError(f"Model setting '{key}' must be positive.")
+        globals()[CONFIG_GLOBALS[key]] = number
+    if FADE_YEARS > EXPLICIT_YEARS:
+        raise ConfigurationError("fade_years cannot exceed explicit_years.")
+    if MIN_WACC <= MAX_TERMINAL_GROWTH:
+        raise ConfigurationError("min_wacc must exceed max_terminal_growth.")
+    family = payload.get("family_weights")
+    if family is not None:
+        if not isinstance(family, dict) or set(family) != set(FAMILY_WEIGHTS):
+            raise ConfigurationError("family_weights must specify cash flow, earnings, asset, and market.")
+        parsed = {str(k): safe_number(v) for k, v in family.items()}
+        if any(v is None or v <= 0 for v in parsed.values()):
+            raise ConfigurationError("Every family weight must be positive.")
+        total = sum(float(v) for v in parsed.values() if v is not None)
+        FAMILY_WEIGHTS.update({k: float(v) / total for k, v in parsed.items() if v is not None})
+    sectors = payload.get("sector_profiles")
+    if sectors is not None:
+        if not isinstance(sectors, dict):
+            raise ConfigurationError("sector_profiles must be an object.")
+        required = set(SECTOR_PROFILES["default"])
+        for sector, profile in sectors.items():
+            if not isinstance(profile, dict) or set(profile) != required:
+                raise ConfigurationError(f"Sector '{sector}' must define: {', '.join(sorted(required))}.")
+            parsed_profile = {k: safe_number(v) for k, v in profile.items()}
+            if any(v is None or v <= 0 for v in parsed_profile.values()):
+                raise ConfigurationError(f"Sector '{sector}' contains a non-positive multiple.")
+            SECTOR_PROFILES[str(sector).lower()] = {k: float(v) for k, v in parsed_profile.items() if v is not None}
 
 
 # --------------------------------------------------------------------------
@@ -300,8 +384,16 @@ def cache_get(namespace: str, key: str) -> Optional[Any]:
         if not path.exists() or (time.time() - path.stat().st_mtime) > CACHE_TTL_SECONDS:
             return None
         with path.open("r", encoding="utf-8") as handle:
-            return _decode(json.load(handle))
-    except Exception:
+            envelope = json.load(handle)
+        if not isinstance(envelope, dict) or envelope.get("schema") != CACHE_SCHEMA_VERSION:
+            path.unlink(missing_ok=True)
+            return None
+        return _decode(envelope.get("payload"))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
         return None
 
 
@@ -313,9 +405,9 @@ def cache_put(namespace: str, key: str, value: Any) -> None:
         path = _cache_path(namespace, key)
         tmp = path.with_suffix(".tmp")
         with tmp.open("w", encoding="utf-8") as handle:
-            json.dump(_encode(value), handle)
+            json.dump({"schema": CACHE_SCHEMA_VERSION, "payload": _encode(value)}, handle)
         tmp.replace(path)
-    except Exception:
+    except (OSError, TypeError, ValueError):
         pass  # cache is best-effort and must never break analysis
 
 
@@ -440,6 +532,7 @@ class DCFDetail:
     equity_value: Optional[float] = None
     per_share: Optional[float] = None
     implied_growth: Optional[float] = None        # reverse DCF
+    implied_growth_bound: str = "unavailable"     # exact | lower_bound | upper_bound
     implied_vs_actual: Optional[float] = None     # implied minus realized 3Y
 
 
@@ -1782,17 +1875,18 @@ def dcf_per_share(data: StockData, starting_fcff: float, growth: float,
     return divide(equity_value, shares), parts
 
 
-def reverse_dcf(data: StockData, starting_fcff: float, assumptions: MarketAssumptions) -> Optional[float]:
-    """Solve for the 5-year growth rate the current price implies."""
+def reverse_dcf(data: StockData, starting_fcff: float,
+                assumptions: MarketAssumptions) -> tuple[Optional[float], str]:
+    """Return implied growth and whether it is exact or outside solver bounds."""
     price = data.metrics.get("current_price")
     shares = data.metrics.get("effective_shares")
     if not price or not shares or shares <= 0 or starting_fcff is None or starting_fcff <= 0:
-        return None
+        return None, "unavailable"
     target_equity = price * shares
     net_debt = data.metrics.get("net_debt") or 0.0
     target_ev = target_equity + net_debt
     if target_ev <= 0:
-        return None
+        return None, "unavailable"
 
     def value_at(growth: float) -> Optional[float]:
         enterprise_value, _ = dcf_enterprise_value(
@@ -1801,19 +1895,19 @@ def reverse_dcf(data: StockData, starting_fcff: float, assumptions: MarketAssump
 
     low, high = -0.30, 0.60
     if (value_at(low) or 0) > target_ev:
-        return low
+        return low, "upper_bound"
     if (value_at(high) or 0) < target_ev:
-        return high
+        return high, "lower_bound"
     for _ in range(80):
         mid = (low + high) / 2
         current = value_at(mid)
         if current is None:
-            return None
+            return None, "unavailable"
         if current < target_ev:
             low = mid
         else:
             high = mid
-    return (low + high) / 2
+    return (low + high) / 2, "exact"
 
 
 def normalized_owner_earnings(data: StockData, assumptions: MarketAssumptions) -> tuple[
@@ -2014,9 +2108,9 @@ def estimate_fair_value(
             methods.append(ValuationMethod("DCF (FCFF / WACC)", "cash flow", base, min(bear, base), max(bull, base),
                                            1.0, clamp(reliability), note=note))
 
-        dcf.implied_growth = reverse_dcf(data, starting_fcff, assumptions)
+        dcf.implied_growth, dcf.implied_growth_bound = reverse_dcf(data, starting_fcff, assumptions)
         realized = m.get("revenue_cagr3")
-        if dcf.implied_growth is not None and realized is not None:
+        if dcf.implied_growth is not None and realized is not None and dcf.implied_growth_bound == "exact":
             dcf.implied_vs_actual = dcf.implied_growth - realized
 
     # Earnings power value: no growth at all, capitalized in perpetuity. This is
@@ -2537,12 +2631,16 @@ def load_category_weights(path: Optional[str]) -> Optional[dict[str, float]]:
 
 def analyze(data: StockData, peer_symbols: list[str],
             category_weights: Optional[dict[str, float]] = None,
-            mos_override: Optional[float] = None) -> AnalysisResult:
+            mos_override: Optional[float] = None,
+            risk_free_override: Optional[float] = None) -> AnalysisResult:
     peer_medians, peers_used = fetch_peer_medians(peer_symbols, data.warnings, data.sector)
     data.peers_used = peers_used
     data.peer_medians = peer_medians
 
-    risk_free, rate_source = fetch_risk_free_rate(data.warnings)
+    if risk_free_override is None:
+        risk_free, rate_source = fetch_risk_free_rate(data.warnings)
+    else:
+        risk_free, rate_source = risk_free_override, "explicit override"
     assumptions = build_assumptions(data, risk_free, rate_source)
 
     confidence = confidence_score(data)
@@ -2589,8 +2687,11 @@ def analyze(data: StockData, peer_symbols: list[str],
         direction = ("upside" if (fair_value.upside_downside or 0) >= 0 else "downside")
         implied = ""
         if fair_value.dcf.implied_growth is not None:
-            implied = (f" At the current price the market is pricing roughly "
-                       f"{fair_value.dcf.implied_growth:.1%} annual cash-flow growth")
+            qualifier = ("at most " if fair_value.dcf.implied_growth_bound == "upper_bound"
+                         else "at least " if fair_value.dcf.implied_growth_bound == "lower_bound"
+                         else "roughly ")
+            implied = (f" At the current price the market is pricing "
+                       f"{qualifier}{fair_value.dcf.implied_growth:.1%} annual cash-flow growth")
             if fair_value.dcf.implied_vs_actual is not None:
                 realized = fair_value.dcf.implied_growth - fair_value.dcf.implied_vs_actual
                 implied += f", against {realized:.1%} realized over the last three years"
@@ -2641,6 +2742,14 @@ def price_text(value: Optional[float], currency: str) -> str:
 
 def pct(value: Optional[float], digits: int = 1) -> str:
     return "N/A" if value is None else f"{value:.{digits}%}"
+
+
+def implied_growth_text(detail: DCFDetail) -> str:
+    if detail.implied_growth is None:
+        return "N/A"
+    prefix = ("≤ " if detail.implied_growth_bound == "upper_bound"
+              else "≥ " if detail.implied_growth_bound == "lower_bound" else "")
+    return prefix + pct(detail.implied_growth)
 
 
 def multiple(value: Optional[float]) -> str:
@@ -2762,7 +2871,7 @@ def print_report(data: StockData, result: AnalysisResult, detail: str = "standar
 
     p.line()
     p.box((
-        (f"{data.company_name.upper()} ({data.symbol})  -  VALUATION MODEL V5", "title"),
+        (f"{data.company_name.upper()} ({data.symbol})  -  VALUATION MODEL V6", "title"),
         (f"Current price      {price_text(m.get('current_price'), data.currency)}", None),
         (f"Fair value         {price_text(fv.base, data.currency)}   ({relation})",
          "value" if fv.base is not None else "bad"),
@@ -2803,14 +2912,16 @@ def print_report(data: StockData, result: AnalysisResult, detail: str = "standar
                        else "the market demands less growth than recently delivered" if gap < -0.02
                        else "the market is roughly extrapolating recent growth")
         p.key_values((
-            ("Implied 5Y cash-flow growth", pct(fv.dcf.implied_growth), "value"),
+            ("Implied 5Y cash-flow growth", implied_growth_text(fv.dcf), "value"),
             ("Realized revenue CAGR 3Y / 5Y", f"{pct(realized3)} / {pct(realized5)}", None),
             ("Implied minus realized", pct(gap) if gap is not None else "N/A",
              "bad" if (gap or 0) > 0.05 else "good"),
             ("Reading", verdict, "neutral"),
         ))
-        p.wrapped("This is the most falsifiable figure in the report: it is the growth rate that makes "
-                  "today's price exactly fair under the stated WACC and terminal growth.", tone="dim")
+        explanation = ("The exact solution lies outside the displayed solver range."
+                       if fv.dcf.implied_growth_bound != "exact"
+                       else "This is the growth rate that makes today's price exactly fair under the stated WACC and terminal growth.")
+        p.wrapped(explanation, tone="dim")
     else:
         p.wrapped("A reverse DCF could not be solved (non-positive or unavailable owner cash flow).", tone="dim")
 
@@ -3020,6 +3131,7 @@ def result_to_dict(data: StockData, result: AnalysisResult) -> dict[str, Any]:
         },
         "reverse_dcf": {
             "implied_growth": fv.dcf.implied_growth,
+            "bound": fv.dcf.implied_growth_bound,
             "realized_revenue_cagr3": data.metrics.get("revenue_cagr3"),
             "realized_revenue_cagr5": data.metrics.get("revenue_cagr5"),
             "implied_minus_realized": fv.dcf.implied_vs_actual,
@@ -3072,7 +3184,7 @@ SNAPSHOT_FIELDS = [
     "confidence", "data_coverage", "data_freshness", "statement_integrity", "model_fit",
     "model_confidence", "cross_family_agreement", "fair_value", "buy_below",
     "margin_of_safety", "upside_downside", "discount_premium", "valuation_status",
-    "action", "implied_growth", "realized_cagr3", "piotroski_f", "altman_z", "beneish_m",
+    "action", "implied_growth", "implied_growth_bound", "realized_cagr3", "piotroski_f", "altman_z", "beneish_m",
     *[f"cat_{key}" for key in CATEGORY_MAXIMUMS],
     "future_return", "benchmark_return",
 ]
@@ -3098,7 +3210,8 @@ def append_snapshot(path: str, data: StockData, result: AnalysisResult) -> None:
         "buy_below": fv.buy_below, "margin_of_safety": fv.margin_of_safety,
         "upside_downside": fv.upside_downside, "discount_premium": fv.discount_premium,
         "valuation_status": fv.status, "action": fv.action,
-        "implied_growth": fv.dcf.implied_growth, "realized_cagr3": data.metrics.get("revenue_cagr3"),
+        "implied_growth": fv.dcf.implied_growth, "implied_growth_bound": fv.dcf.implied_growth_bound,
+        "realized_cagr3": data.metrics.get("revenue_cagr3"),
         "piotroski_f": f.piotroski, "altman_z": f.altman_z, "beneish_m": f.beneish_m,
         "future_return": "", "benchmark_return": "",
     }
@@ -3153,9 +3266,21 @@ def run_backtest(path: str, calibrate_out: Optional[str] = None) -> int:
         return 1
 
     frame["excess_return"] = frame["future_return"]
+    return_basis = "absolute return (no benchmark observations supplied)"
     if "benchmark_return" in frame:
         benchmark = pd.to_numeric(frame["benchmark_return"], errors="coerce")
-        frame["excess_return"] = frame["future_return"] - benchmark.fillna(0)
+        matched = benchmark.notna()
+        if matched.any():
+            omitted = int((~matched).sum())
+            if omitted:
+                print(f"Excluded {omitted} row(s) without benchmark returns; absolute and excess returns are never mixed.")
+            frame = frame.loc[matched].copy()
+            benchmark = benchmark.loc[matched]
+            frame["excess_return"] = frame["future_return"] - benchmark
+            return_basis = "benchmark-relative excess return"
+            if len(frame) < 20:
+                print("At least 20 observations with matched benchmark returns are required.")
+                return 1
 
     dates = frame["date"].nunique() if "date" in frame.columns else len(frame)
     tickers = frame["ticker"].nunique() if "ticker" in frame.columns else len(frame)
@@ -3171,6 +3296,7 @@ def run_backtest(path: str, calibrate_out: Optional[str] = None) -> int:
 
     print("\nPOINT-IN-TIME CALIBRATION REPORT")
     print(f"Observations:              {len(frame)}")
+    print(f"Return basis:              {return_basis}")
     print(f"Distinct dates / tickers:  {dates} / {tickers}")
     print(f"Spearman rank correlation: {spearman: .3f}")
     if math.isfinite(lower):
@@ -3362,7 +3488,7 @@ def self_test() -> int:
     check("WACC is between the bounds", MIN_WACC <= assumptions.wacc <= MAX_WACC)
     check("terminal growth is below WACC", assumptions.terminal_growth < assumptions.wacc)
 
-    result = analyze(data, [], None, None)
+    result = analyze(data, [], None, None, risk_free_override=0.042)
     fv = result.fair_value
     check("fair value issued", fv.base is not None, f"(action {fv.action})")
     if fv.base is not None:
@@ -3386,7 +3512,7 @@ def self_test() -> int:
     expensive = _synthetic_company()
     put_metric(expensive, "current_price", 200.0, "market quote", "current", None, 0.98)
     derive_metrics(expensive)
-    expensive_result = analyze(expensive, [], None, None)
+    expensive_result = analyze(expensive, [], None, None, risk_free_override=0.042)
     check("a 10x higher price reads as overvalued",
           "OVER" in expensive_result.fair_value.status or "ABOVE" in expensive_result.fair_value.action,
           f"(got {expensive_result.fair_value.status} / {expensive_result.fair_value.action})")
@@ -3428,13 +3554,15 @@ def analyze_symbol(symbol: str, peers: list[str], snapshot_csv: Optional[str],
             print(json.dumps({"error": f"{type(exc).__name__}: {exc}"}))
         else:
             print(f"Unexpected provider or model error: {type(exc).__name__}: {exc}")
-            print("The provider may have changed a field name. No rating was fabricated.")
+            print("No rating was fabricated. Re-run with --debug to distinguish provider failures from model defects.")
+        if DEBUG_MODE:
+            traceback.print_exc(file=sys.stderr)
     return 1
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Fundamental equity valuation model V5: fair value, buy-below price, and verdict.")
+        description="Fundamental equity valuation model V6: fair value, buy-below price, and verdict.")
     parser.add_argument("--ticker", help="Ticker to analyze, for example AAPL")
     parser.add_argument("--peers", default="", help="Comma-separated peer tickers for relative multiples")
     parser.add_argument("--mos", type=float, help="Override the required margin of safety, e.g. 0.30")
@@ -3442,15 +3570,22 @@ def main() -> int:
     parser.add_argument("--backtest-csv", help="Evaluate completed point-in-time observations")
     parser.add_argument("--calibrate-out", help="With --backtest-csv, write candidate category weights")
     parser.add_argument("--weights-json", help="Apply previously validated category weights")
+    parser.add_argument("--config-json", help="Override documented model assumptions and valuation profiles")
     parser.add_argument("--detail", choices=REPORT_DETAILS, default="standard", help="Report depth")
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors")
     parser.add_argument("--no-cache", action="store_true", help="Bypass the on-disk provider cache")
     parser.add_argument("--clear-cache", action="store_true", help="Delete cached provider data and exit")
     parser.add_argument("--self-test", action="store_true", help="Run offline checks and exit")
+    parser.add_argument("--debug", action="store_true", help="Print tracebacks for unexpected internal errors")
     args = parser.parse_args()
 
-    global CACHE_ENABLED
+    global CACHE_ENABLED, DEBUG_MODE
+    DEBUG_MODE = args.debug
+    try:
+        load_model_config(args.config_json)
+    except ConfigurationError as exc:
+        parser.error(str(exc))
     if args.no_cache:
         CACHE_ENABLED = False
     if args.clear_cache:

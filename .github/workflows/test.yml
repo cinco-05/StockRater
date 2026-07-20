@@ -21,6 +21,6 @@ jobs:
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -r requirements-dev.txt
-      - run: python -m py_compile stock_analyzer.py stock_analyzer_v6.py
-      - run: python stock_analyzer_v6.py --self-test
+      - run: python -m py_compile stock_analyzer.py
+      - run: python stock_analyzer.py --self-test
       - run: python -m pytest -q
