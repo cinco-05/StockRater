@@ -1,7 +1,6 @@
-"""Fundamental equity valuation model V6.
+"""Fundamental equity valuation model V5.
 
-Evolved from V5 with stricter backtesting, explicit reverse-DCF bounds,
-versioned caches, auditable configuration, and stronger diagnostics.
+Rebuilt from V4 with a focus on valuation correctness rather than feature count.
 The headline output is a per-share economic fair value, a margin-of-safety
 adjusted BUY-BELOW price, and an over/undervaluation verdict.
 
@@ -39,16 +38,53 @@ What changed versus V4 (and why it matters for accuracy)
 12. Threaded peer fetch, bootstrap confidence intervals in the backtester, and
     a --self-test mode that exercises the pure functions with no network.
 
+What changed in V5.1 (and why it matters for accuracy)
+------------------------------------------------------
+13. Cross-source validation. The highest-weight inputs are no longer trusted on
+    one provider's word. Price is checked against Stooq's independent feed, and
+    for USD-reporting US filers the core statement lines (revenue, net income,
+    OCF, capex, assets, equity, diluted shares) are checked against SEC EDGAR
+    companyfacts - the primary source, straight from the XBRL filings. A
+    confirmed input earns a small reliability bump; a conflict cuts that
+    input's reliability hard and is reported, so a mangled provider row lowers
+    confidence instead of silently steering the fair value.
+14. Backtest-calibrated curve shapes and DCF bands, not just weights.
+    --calibrate-out now emits a full calibration file: category weights (as
+    before), a per-category curve exponent (gamma) that steepens scoring
+    curves for categories with demonstrated rank-correlation to forward excess
+    returns and flattens them toward neutral for categories without it, and a
+    DCF band scale that widens or narrows every method's bear/bull range to
+    match the realized dispersion of (predicted upside - realized return).
+    Apply a validated file with --calibration-json. The same data-sufficiency
+    gates apply: no calibration is emitted from a sample too small to mean
+    anything.
+15. Rate-sensitive sector anchors. The hardcoded sector multiples are treated
+    as observations at a 4.2% 10Y baseline and re-derived in yield space for
+    the live risk-free rate (a 26x P/E anchor is an earnings-yield spread
+    claim, not a constant). Optionally, each anchor also blends against the
+    live trailing P/E of the matching SPDR sector ETF, cached daily, so the
+    anchor drifts with the market instead of with the file's edit date.
+16. Peer matching that degrades instead of discarding. A user-supplied peer in
+    a different sector is now included at half weight with a note (you named
+    it; the model shouldn't pretend it doesn't exist) instead of being dropped,
+    and within-sector matching is normalization-tolerant. Medians are
+    weight-aware, so peer_medians stops coming back empty when it shouldn't.
+
 Install:
     pip install yfinance pandas numpy
 
 Run:
-    python stock_analyzer.py --ticker AAPL
-    python stock_analyzer.py --ticker AAPL --peers MSFT,GOOGL --detail detailed
-    python stock_analyzer.py --ticker AAPL --json
-    python stock_analyzer.py --mos 0.30 --ticker AAPL
-    python stock_analyzer.py --self-test
-    python stock_analyzer.py --backtest-csv history.csv
+    python stock_analyzer_v5.py --ticker AAPL
+    python stock_analyzer_v5.py --ticker AAPL --peers MSFT,GOOGL --detail detailed
+    python stock_analyzer_v5.py --ticker AAPL --json
+    python stock_analyzer_v5.py --ticker AAPL --mos 0.30      # demand a 30% discount
+    python stock_analyzer_v5.py --ticker AAPL --no-secondary  # skip Stooq/EDGAR checks
+    python stock_analyzer_v5.py --self-test                   # no network required
+    python stock_analyzer_v5.py --backtest-csv history.csv --calibrate-out calib.json
+    python stock_analyzer_v5.py --ticker AAPL --calibration-json calib.json
+
+Set SAV5_EDGAR_UA to "your-app-name your@email" to identify yourself to the
+SEC's API per their fair-access policy (a generic default is used otherwise).
 
 Educational quantitative screen. Not investment advice.
 """
@@ -68,7 +104,8 @@ import sys
 import tempfile
 import textwrap
 import time
-import traceback
+import urllib.error
+import urllib.request
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -113,11 +150,9 @@ MIN_CATEGORY_COVERAGE = 0.40
 MAX_FAMILY_RATIO = 3.0               # across-family high/low above this -> no point estimate
 MAX_TERMINAL_SHARE = 0.80            # terminal value share of EV above this -> flagged
 
-CACHE_SCHEMA_VERSION = 2
-CACHE_DIR = Path(os.environ.get("SAV6_CACHE", Path(tempfile.gettempdir()) / "stock_analyzer_v6"))
-CACHE_TTL_SECONDS = int(os.environ.get("SAV6_CACHE_TTL", 6 * 60 * 60))
+CACHE_DIR = Path(os.environ.get("SAV5_CACHE", Path(tempfile.gettempdir()) / "stock_analyzer_v5"))
+CACHE_TTL_SECONDS = int(os.environ.get("SAV5_CACHE_TTL", 6 * 60 * 60))
 CACHE_ENABLED = True
-DEBUG_MODE = False
 
 CATEGORY_MAXIMUMS = {
     "profitability": 20.0,
@@ -157,89 +192,50 @@ SECTOR_PROFILES: dict[str, dict[str, float]] = {
     "default":                {"pe": 20, "forward_pe": 18, "pfcf": 19, "ps": 2.8, "ev_ebitda": 12, "ev_ebit": 16},
 }
 
+# The SECTOR_PROFILES table is an observation made at a specific rate regime,
+# not a set of timeless constants. Anchors are re-derived in yield space for
+# the live risk-free rate: earnings yield anchor = 1/multiple, and only a
+# fraction (ANCHOR_RATE_BETA) of a rate move passes through, because equity
+# multiples empirically underreact to bond yields.
+ANCHOR_BASE_RF = 0.042               # the 10Y level the table above was set at
+ANCHOR_RATE_BETA = 0.60              # pass-through of rate moves into earnings yields
+ANCHOR_RATE_CLAMP = (0.72, 1.30)     # rate adjustment can move an anchor at most this much
+LIVE_ANCHOR_TTL = int(os.environ.get("SAV5_ANCHOR_TTL", 24 * 60 * 60))
+
+# SPDR sector ETFs used to refresh P/E anchors from live index data.
+SECTOR_ETFS = {
+    "technology": "XLK", "communication services": "XLC", "consumer cyclical": "XLY",
+    "consumer defensive": "XLP", "industrials": "XLI", "healthcare": "XLV",
+    "energy": "XLE", "basic materials": "XLB", "utilities": "XLU",
+    "real estate": "XLRE", "financial services": "XLF",
+}
+
+# Cross-source validation of the highest-weight inputs. Each entry maps a
+# metric key to (relative gap that still counts as confirmed, gap beyond which
+# it is a conflict). Statement lines compare same-fiscal-year values (EDGAR FY
+# versus this model's annual series), so tolerances can be tight; small gaps
+# remain legitimate (restatements, segment definitions, share-class rollups).
+SECONDARY_ENABLED = True
+VALIDATION_TOLERANCES: dict[str, tuple[float, float]] = {
+    "current_price": (0.03, 0.10),   # Stooq is typically the prior close
+    "revenue": (0.03, 0.12),
+    "net_income": (0.05, 0.20),
+    "ocf": (0.05, 0.20),
+    "capex": (0.08, 0.30),           # EDGAR tag excludes some intangible capex
+    "assets": (0.03, 0.12),
+    "equity": (0.05, 0.20),
+    "diluted_shares": (0.03, 0.12),
+}
+VALIDATION_CONFIRM_BONUS = 1.04      # multiplicative, capped at 0.99
+VALIDATION_CONFLICT_PENALTY = 0.55
+
+# Calibration clamps: how far the backtester is allowed to bend the model.
+CURVE_GAMMA_RANGE = (0.60, 1.60)     # per-category scoring-curve exponent
+DCF_BAND_SCALE_RANGE = (0.60, 2.00)  # bear/bull half-width multiplier
+
 
 class StockDataError(RuntimeError):
     """Raised when no defensible analysis can be produced for a symbol."""
-
-
-class ConfigurationError(ValueError):
-    """Raised when a model configuration file is unsafe or invalid."""
-
-
-CONFIGURABLE_DEFAULTS: dict[str, float | int] = {
-    "default_risk_free": DEFAULT_RISK_FREE,
-    "equity_risk_premium": EQUITY_RISK_PREMIUM,
-    "min_cost_of_equity": MIN_COST_OF_EQUITY,
-    "max_cost_of_equity": MAX_COST_OF_EQUITY,
-    "min_wacc": MIN_WACC,
-    "max_wacc": MAX_WACC,
-    "terminal_spread_to_rf": TERMINAL_SPREAD_TO_RF,
-    "min_terminal_growth": MIN_TERMINAL_GROWTH,
-    "max_terminal_growth": MAX_TERMINAL_GROWTH,
-    "explicit_years": EXPLICIT_YEARS,
-    "fade_years": FADE_YEARS,
-    "statutory_tax_fallback": STATUTORY_TAX_FALLBACK,
-    "max_family_ratio": MAX_FAMILY_RATIO,
-    "max_terminal_share": MAX_TERMINAL_SHARE,
-}
-
-CONFIG_GLOBALS = {key: key.upper() for key in CONFIGURABLE_DEFAULTS}
-
-
-def load_model_config(path: Optional[str]) -> None:
-    """Apply a small, validated JSON override set to documented model defaults."""
-    if not path:
-        return
-    source = Path(path)
-    try:
-        payload = json.loads(source.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ConfigurationError(f"Could not read model configuration: {exc}") from exc
-    if not isinstance(payload, dict):
-        raise ConfigurationError("Model configuration must be a JSON object.")
-    unknown = set(payload) - {"model", "family_weights", "sector_profiles"}
-    if unknown:
-        raise ConfigurationError("Unknown configuration section(s): " + ", ".join(sorted(unknown)))
-    model = payload.get("model", {})
-    if not isinstance(model, dict):
-        raise ConfigurationError("The 'model' section must be an object.")
-    unknown_model = set(model) - set(CONFIGURABLE_DEFAULTS)
-    if unknown_model:
-        raise ConfigurationError("Unknown model setting(s): " + ", ".join(sorted(unknown_model)))
-    for key, value in model.items():
-        number = safe_number(value)
-        if number is None:
-            raise ConfigurationError(f"Model setting '{key}' must be finite and numeric.")
-        if key in {"explicit_years", "fade_years"}:
-            number = int(number)
-            if number < 1:
-                raise ConfigurationError(f"Model setting '{key}' must be positive.")
-        globals()[CONFIG_GLOBALS[key]] = number
-    if FADE_YEARS > EXPLICIT_YEARS:
-        raise ConfigurationError("fade_years cannot exceed explicit_years.")
-    if MIN_WACC <= MAX_TERMINAL_GROWTH:
-        raise ConfigurationError("min_wacc must exceed max_terminal_growth.")
-    family = payload.get("family_weights")
-    if family is not None:
-        if not isinstance(family, dict) or set(family) != set(FAMILY_WEIGHTS):
-            raise ConfigurationError("family_weights must specify cash flow, earnings, asset, and market.")
-        parsed = {str(k): safe_number(v) for k, v in family.items()}
-        if any(v is None or v <= 0 for v in parsed.values()):
-            raise ConfigurationError("Every family weight must be positive.")
-        total = sum(float(v) for v in parsed.values() if v is not None)
-        FAMILY_WEIGHTS.update({k: float(v) / total for k, v in parsed.items() if v is not None})
-    sectors = payload.get("sector_profiles")
-    if sectors is not None:
-        if not isinstance(sectors, dict):
-            raise ConfigurationError("sector_profiles must be an object.")
-        required = set(SECTOR_PROFILES["default"])
-        for sector, profile in sectors.items():
-            if not isinstance(profile, dict) or set(profile) != required:
-                raise ConfigurationError(f"Sector '{sector}' must define: {', '.join(sorted(required))}.")
-            parsed_profile = {k: safe_number(v) for k, v in profile.items()}
-            if any(v is None or v <= 0 for v in parsed_profile.values()):
-                raise ConfigurationError(f"Sector '{sector}' contains a non-positive multiple.")
-            SECTOR_PROFILES[str(sector).lower()] = {k: float(v) for k, v in parsed_profile.items() if v is not None}
 
 
 # --------------------------------------------------------------------------
@@ -384,16 +380,8 @@ def cache_get(namespace: str, key: str) -> Optional[Any]:
         if not path.exists() or (time.time() - path.stat().st_mtime) > CACHE_TTL_SECONDS:
             return None
         with path.open("r", encoding="utf-8") as handle:
-            envelope = json.load(handle)
-        if not isinstance(envelope, dict) or envelope.get("schema") != CACHE_SCHEMA_VERSION:
-            path.unlink(missing_ok=True)
-            return None
-        return _decode(envelope.get("payload"))
-    except (OSError, json.JSONDecodeError, TypeError, ValueError):
-        try:
-            path.unlink(missing_ok=True)
-        except OSError:
-            pass
+            return _decode(json.load(handle))
+    except Exception:
         return None
 
 
@@ -405,9 +393,9 @@ def cache_put(namespace: str, key: str, value: Any) -> None:
         path = _cache_path(namespace, key)
         tmp = path.with_suffix(".tmp")
         with tmp.open("w", encoding="utf-8") as handle:
-            json.dump({"schema": CACHE_SCHEMA_VERSION, "payload": _encode(value)}, handle)
+            json.dump(_encode(value), handle)
         tmp.replace(path)
-    except (OSError, TypeError, ValueError):
+    except Exception:
         pass  # cache is best-effort and must never break analysis
 
 
@@ -442,6 +430,28 @@ class IntegrityCheck:
     passed: bool
     detail: str
     severity: str = "warning"      # "warning" | "critical"
+
+
+@dataclass
+class ValidationCheck:
+    """One primary-versus-secondary comparison on a high-weight input."""
+    key: str
+    primary: float
+    secondary: float
+    source: str
+    gap: float                     # abs relative difference
+    verdict: str                   # "confirmed" | "review" | "conflict"
+    detail: str = ""
+
+
+@dataclass
+class Calibration:
+    """Backtest-derived adjustments. Every field is optional so a plain
+    category-weight file (the old --weights-json format) still loads."""
+    category_weights: Optional[dict[str, float]] = None
+    curve_gamma: Optional[dict[str, float]] = None
+    dcf_band_scale: Optional[float] = None
+    provenance: str = ""
 
 
 @dataclass
@@ -488,6 +498,7 @@ class StockData:
     price_history: pd.DataFrame = field(default_factory=pd.DataFrame)
     warnings: list[str] = field(default_factory=list)
     integrity: list[IntegrityCheck] = field(default_factory=list)
+    validation: list[ValidationCheck] = field(default_factory=list)
     forensics: ForensicScores = field(default_factory=ForensicScores)
     special_model: Optional[str] = None
     peers_used: list[str] = field(default_factory=list)
@@ -532,7 +543,6 @@ class DCFDetail:
     equity_value: Optional[float] = None
     per_share: Optional[float] = None
     implied_growth: Optional[float] = None        # reverse DCF
-    implied_growth_bound: str = "unavailable"     # exact | lower_bound | upper_bound
     implied_vs_actual: Optional[float] = None     # implied minus realized 3Y
 
 
@@ -905,6 +915,211 @@ def download_raw_payload(symbol: str, warnings: list[str]) -> dict[str, Any]:
     return payload
 
 
+# --------------------------------------------------------------------------
+# Secondary sources: Stooq price check and SEC EDGAR statement check
+# --------------------------------------------------------------------------
+# The single biggest failure mode of a one-provider model is a silently wrong
+# input. These functions add an independent read on the handful of inputs
+# that carry the most confidence weight. They are strictly best-effort: any
+# failure leaves the model exactly as it was, minus the bonus a confirmation
+# would have earned.
+
+_EDGAR_UA = os.environ.get("SAV5_EDGAR_UA", "stock-analyzer-v5 research (set SAV5_EDGAR_UA)")
+
+# us-gaap XBRL tags checked in order for each metric; first match wins.
+EDGAR_TAGS: dict[str, tuple[str, ...]] = {
+    "revenue": ("Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax",
+                "RevenueFromContractWithCustomerIncludingAssessedTax", "SalesRevenueNet"),
+    "net_income": ("NetIncomeLoss",),
+    "ocf": ("NetCashProvidedByUsedInOperatingActivities",
+            "NetCashProvidedByUsedInOperatingActivitiesContinuingOperations"),
+    "capex": ("PaymentsToAcquirePropertyPlantAndEquipment",
+              "PaymentsToAcquireProductiveAssets"),
+    "assets": ("Assets",),
+    "equity": ("StockholdersEquity",
+               "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"),
+    "diluted_shares": ("WeightedAverageNumberOfDilutedSharesOutstanding",),
+}
+
+
+def _http_get(url: str, timeout: float = 10.0) -> Optional[bytes]:
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": _EDGAR_UA,
+                                                       "Accept-Encoding": "identity"})
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.read()
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, ValueError):
+        return None
+
+
+def fetch_stooq_price(symbol: str) -> Optional[float]:
+    """Independent daily close from Stooq. US common tickers only; anything
+    with exchange suffixes, carets, or equals signs is out of scope."""
+    if not re.fullmatch(r"[A-Z]{1,5}", symbol):
+        return None
+    cached = cache_get("stooq", symbol)
+    if cached is not None:
+        return safe_number(cached.get("close"))
+    raw = _http_get(f"https://stooq.com/q/l/?s={symbol.lower()}.us&f=sd2t2ohlcv&h&e=csv")
+    if raw is None:
+        return None
+    try:
+        lines = raw.decode("utf-8", errors="replace").strip().splitlines()
+        if len(lines) < 2:
+            return None
+        header = [h.strip().lower() for h in lines[0].split(",")]
+        row = lines[1].split(",")
+        close = safe_number(row[header.index("close")]) if "close" in header else None
+        if close is not None and close > 0:
+            cache_put("stooq", symbol, {"close": close})
+            return close
+    except (IndexError, ValueError):
+        pass
+    return None
+
+
+def _edgar_cik(symbol: str) -> Optional[str]:
+    """Zero-padded 10-digit CIK for a ticker, from the SEC's public mapping."""
+    mapping = cache_get("edgar", "cik_map")
+    if mapping is None:
+        raw = _http_get("https://www.sec.gov/files/company_tickers.json", timeout=15.0)
+        if raw is None:
+            return None
+        try:
+            payload = json.loads(raw)
+            mapping = {str(entry["ticker"]).upper(): int(entry["cik_str"])
+                       for entry in payload.values()
+                       if isinstance(entry, dict) and "ticker" in entry and "cik_str" in entry}
+        except (json.JSONDecodeError, TypeError, ValueError, AttributeError):
+            return None
+        cache_put("edgar", "cik_map", mapping)
+    cik = mapping.get(symbol.upper())
+    return f"{int(cik):010d}" if cik is not None else None
+
+
+def fetch_edgar_annual_facts(symbol: str) -> dict[str, list[tuple[pd.Timestamp, float]]]:
+    """Fiscal-year values per metric from SEC companyfacts (10-K entries, USD
+    or share units), newest first. Returns {} on any failure."""
+    cached = cache_get("edgar", f"facts_{symbol}")
+    if cached is not None:
+        try:
+            return {k: [(pd.Timestamp(d), float(v)) for d, v in rows]
+                    for k, rows in cached.items()}
+        except Exception:
+            pass
+    cik = _edgar_cik(symbol)
+    if cik is None:
+        return {}
+    raw = _http_get(f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik}.json", timeout=15.0)
+    if raw is None:
+        return {}
+    try:
+        gaap = json.loads(raw).get("facts", {}).get("us-gaap", {})
+    except (json.JSONDecodeError, AttributeError):
+        return {}
+    results: dict[str, list[tuple[pd.Timestamp, float]]] = {}
+    for key, tags in EDGAR_TAGS.items():
+        wanted_units = ("shares",) if key == "diluted_shares" else ("USD",)
+        for tag in tags:
+            units = gaap.get(tag, {}).get("units", {}) if isinstance(gaap.get(tag), dict) else {}
+            rows: dict[pd.Timestamp, float] = {}
+            for unit in wanted_units:
+                for item in units.get(unit, []):
+                    if not isinstance(item, dict) or item.get("form") != "10-K":
+                        continue
+                    if item.get("fp") not in (None, "FY"):
+                        continue
+                    value = safe_number(item.get("val"))
+                    end = item.get("end")
+                    start = item.get("start")
+                    if value is None or end is None:
+                        continue
+                    try:
+                        end_ts = pd.Timestamp(end)
+                        # Flow tags must cover a full year; a 10-K also reports
+                        # quarterly stubs under the same tag.
+                        if start is not None and key not in ("assets", "equity"):
+                            span = (end_ts - pd.Timestamp(start)).days
+                            if not 300 <= span <= 400:
+                                continue
+                    except (TypeError, ValueError):
+                        continue
+                    rows[end_ts] = value  # later filings supersede earlier ones
+            if rows:
+                results[key] = sorted(rows.items(), key=lambda kv: kv[0], reverse=True)
+                break
+    cache_put("edgar", f"facts_{symbol}",
+              {k: [(d.isoformat(), v) for d, v in rows] for k, rows in results.items()})
+    return results
+
+
+def _apply_validation(data: StockData, key: str, primary: Optional[float],
+                      secondary: Optional[float], source: str) -> None:
+    if primary is None or secondary is None or key not in VALIDATION_TOLERANCES:
+        return
+    denom = max(abs(primary), abs(secondary), 1e-9)
+    gap = abs(primary - secondary) / denom
+    confirm_at, conflict_at = VALIDATION_TOLERANCES[key]
+    if gap <= confirm_at:
+        verdict, detail = "confirmed", f"within {confirm_at:.0%} of {source}"
+        if key in data.meta:
+            data.meta[key].reliability = min(0.99, data.meta[key].reliability * VALIDATION_CONFIRM_BONUS)
+    elif gap >= conflict_at:
+        verdict, detail = "conflict", f"differs {gap:.0%} from {source}; input reliability was cut"
+        if key in data.meta:
+            data.meta[key].reliability *= VALIDATION_CONFLICT_PENALTY
+        data.warnings.append(
+            f"Cross-source conflict on {key}: the primary value differs {gap:.0%} from {source}. "
+            "Verify the filing before trusting any output that depends on it."
+        )
+    else:
+        verdict, detail = "review", f"differs {gap:.0%} from {source}; plausibly definitional"
+    data.validation.append(ValidationCheck(key, float(primary), float(secondary),
+                                           source, float(gap), verdict, detail))
+
+
+def cross_validate_secondary(data: StockData) -> None:
+    """Check the highest-weight inputs against independent sources.
+
+    - Price: Stooq daily close versus the live quote.
+    - Statements: SEC EDGAR companyfacts (the filings themselves) versus this
+      model's annual series, matched on fiscal year end, for USD US filers.
+
+    Confirmed inputs earn a small reliability bump; conflicts are penalized
+    hard and surfaced. FY-level validation deliberately backs the same series
+    the TTM figures are built from, so the reliability adjustment lands on the
+    metric that actually feeds the valuation."""
+    if not SECONDARY_ENABLED:
+        return
+    price = data.metrics.get("current_price")
+    stooq = fetch_stooq_price(data.symbol)
+    if price is not None and stooq is not None:
+        _apply_validation(data, "current_price", price, stooq, "Stooq")
+
+    if data.financial_currency != "USD" or data.currency != "USD":
+        return
+    facts = fetch_edgar_annual_facts(data.symbol)
+    if not facts:
+        return
+    for key, rows in facts.items():
+        ours = data.annual.get(key, pd.Series(dtype=float)).dropna()
+        if key == "capex":
+            ours = ours.abs()
+        if ours.empty:
+            continue
+        # Match the newest EDGAR fiscal year to our series on period end.
+        for end_ts, value in rows[:2]:
+            candidates = [(abs((pd.Timestamp(idx) - end_ts).days), idx) for idx in ours.index]
+            if not candidates:
+                continue
+            days, idx = min(candidates)
+            if days <= 15:
+                primary = safe_number(ours.loc[idx])
+                secondary = abs(value) if key == "capex" else value
+                _apply_validation(data, key, primary, secondary, "SEC EDGAR")
+                break
+
+
 # Statement row aliases. Order matters: the first match wins.
 LINE_ALIASES: dict[str, tuple[str, ...]] = {
     # income statement
@@ -1143,6 +1358,7 @@ def fetch_stock_data(symbol: str) -> StockData:
     put_metric(data, "revision_balance", revision, "estimate revisions", "recent", None, 0.68)
 
     run_integrity_checks(data)
+    cross_validate_secondary(data)   # adjust input reliability before anything derives from it
     derive_metrics(data)
     data.forensics = compute_forensics(data)
     return data
@@ -1656,7 +1872,22 @@ def compute_forensics(data: StockData) -> ForensicScores:
 # Peers and relative-multiple targets
 # --------------------------------------------------------------------------
 
-def _peer_row(symbol: str, expected_sector: str) -> tuple[str, Optional[dict[str, float]], Optional[str]]:
+def _peer_row(symbol: str, expected_sector: str,
+              expected_industry: str) -> tuple[str, Optional[dict[str, float]], float, Optional[str]]:
+    """Return (symbol, multiples, weight, note).
+
+    V5 dropped any peer whose sector string didn't match exactly, which meant
+    peer_medians came back empty for perfectly reasonable comparables ("Not
+    available" sectors, cross-listed names, near-miss classifications). The
+    user chose these peers on purpose, so mismatches now DEGRADE the peer's
+    weight instead of discarding it:
+
+        same sector or same industry .......... weight 1.0
+        sector unknown on either side ......... weight 0.75
+        genuinely different sector ............ weight 0.5, with a note
+
+    Only non-equity instruments and peers with no usable multiples are still
+    excluded outright."""
     try:
         info = cache_get("peer_info", symbol)
         if info is None:
@@ -1664,9 +1895,24 @@ def _peer_row(symbol: str, expected_sector: str) -> tuple[str, Optional[dict[str
             info = info if isinstance(info, dict) else {}
             info = {k: v for k, v in info.items() if isinstance(v, (str, int, float, bool)) or v is None}
             cache_put("peer_info", symbol, info)
-        peer_sector = str(info.get("sector") or "").lower()
-        if expected_sector and peer_sector and peer_sector != expected_sector.lower():
-            return symbol, None, f"Peer {symbol} was excluded: its sector does not match."
+        quote_type = str(info.get("quoteType") or "EQUITY").upper()
+        if quote_type in {"ETF", "MUTUALFUND", "INDEX", "CURRENCY", "CRYPTOCURRENCY"}:
+            return symbol, None, 0.0, f"Peer {symbol} was excluded: it is a {quote_type.lower()}, not an operating company."
+
+        peer_sector = normalize_label(info.get("sector") or "")
+        peer_industry = normalize_label(info.get("industry") or "")
+        want_sector = normalize_label(expected_sector) if expected_sector.lower() not in ("", "not available") else ""
+        want_industry = normalize_label(expected_industry) if expected_industry.lower() not in ("", "not available") else ""
+        note = None
+        if not peer_sector or not want_sector:
+            weight = 0.75
+        elif peer_sector == want_sector or (want_industry and peer_industry == want_industry):
+            weight = 1.0
+        else:
+            weight = 0.5
+            note = (f"Peer {symbol} is in a different sector "
+                    f"({info.get('sector')}); it was kept at half weight.")
+
         same_currency = str(info.get("currency") or "").upper() == str(
             info.get("financialCurrency") or info.get("currency") or "").upper()
         row = {
@@ -1678,34 +1924,94 @@ def _peer_row(symbol: str, expected_sector: str) -> tuple[str, Optional[dict[str
         }
         usable = {k: v for k, v in row.items() if v is not None and 0 < v < 500}
         if not usable:
-            return symbol, None, f"Peer {symbol} returned no usable multiples."
-        return symbol, usable, None
+            return symbol, None, 0.0, f"Peer {symbol} returned no usable multiples."
+        return symbol, usable, weight, note
     except Exception as exc:
-        return symbol, None, f"Peer {symbol} could not be retrieved: {type(exc).__name__}."
+        return symbol, None, 0.0, f"Peer {symbol} could not be retrieved: {type(exc).__name__}."
 
 
-def fetch_peer_medians(symbols: list[str], warnings: list[str], expected_sector: str) -> tuple[dict[str, float], list[str]]:
+def fetch_peer_medians(symbols: list[str], warnings: list[str], expected_sector: str,
+                       expected_industry: str = "") -> tuple[dict[str, float], list[str]]:
     if yf is None or not symbols:
         return {}, []
-    rows: list[dict[str, float]] = []
+    rows: list[tuple[dict[str, float], float]] = []
     used: list[str] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(symbols))) as pool:
-        for symbol, row, warning in pool.map(lambda s: _peer_row(s, expected_sector), symbols[:8]):
+        for symbol, row, weight, warning in pool.map(
+                lambda s: _peer_row(s, expected_sector, expected_industry), symbols[:8]):
             if warning:
                 warnings.append(warning)
-            if row:
-                rows.append(row)
+            if row and weight > 0:
+                rows.append((row, weight))
                 used.append(symbol)
     medians: dict[str, float] = {}
     for key in ("pe", "forward_pe", "pfcf", "ps", "ev_ebitda"):
-        values = [row[key] for row in rows if key in row]
-        if len(values) >= 2:
-            medians[key] = float(np.median(values))
+        pairs = [(row[key], weight) for row, weight in rows if key in row]
+        # One full-weight peer, or two of any weight, is enough for a usable
+        # (if weak) central tendency; the anchor clamp in valuation_targets
+        # bounds the damage a thin peer set can do.
+        if len(pairs) >= 2 or any(weight >= 1.0 for _, weight in pairs):
+            if pairs:
+                medians[key] = float(weighted_median(pairs))
     return medians, sorted(used)
 
 
 def sector_profile(data: StockData) -> dict[str, float]:
     return SECTOR_PROFILES.get(data.sector.lower(), SECTOR_PROFILES["default"]).copy()
+
+
+def rate_adjusted_anchors(anchors: dict[str, float], risk_free: float) -> dict[str, float]:
+    """Re-derive the multiple anchors for the live rate regime.
+
+    A P/E anchor is an earnings-yield claim: 26x is a 3.85% earnings yield
+    that made sense against ANCHOR_BASE_RF. When the 10Y moves, the required
+    earnings yield moves with it - but only partially (ANCHOR_RATE_BETA),
+    because equity multiples do not track bond yields one-for-one. Working in
+    yield space keeps the adjustment convex the right way: high-multiple
+    (long-duration) sectors move more than low-multiple ones, which is what
+    the data shows. P/S has no yield interpretation, so it gets the square
+    root of the earnings-multiple adjustment as a duration proxy."""
+    delta_yield = (risk_free - ANCHOR_BASE_RF) * ANCHOR_RATE_BETA
+    adjusted: dict[str, float] = {}
+    for key, anchor in anchors.items():
+        if key == "ps":
+            reference = anchors.get("pe", 20.0)
+            factor = _rate_factor(reference, delta_yield) ** 0.5
+        else:
+            factor = _rate_factor(anchor, delta_yield)
+        adjusted[key] = float(anchor * clamp(factor, *ANCHOR_RATE_CLAMP))
+    return adjusted
+
+
+def _rate_factor(anchor_multiple: float, delta_yield: float) -> float:
+    if anchor_multiple <= 0:
+        return 1.0
+    base_yield = 1.0 / anchor_multiple
+    new_yield = max(base_yield + delta_yield, 0.005)
+    return base_yield / new_yield
+
+
+def fetch_live_anchor_pe(sector: str) -> Optional[float]:
+    """Trailing P/E of the matching SPDR sector ETF, cached for a day, so the
+    P/E anchor tracks the market instead of this file's last edit. Clamped to
+    a band around the static anchor downstream, like every other component."""
+    etf = SECTOR_ETFS.get(sector.lower())
+    if etf is None or yf is None:
+        return None
+    cached = cache_get("anchor", etf)
+    if cached is not None:
+        stamp = safe_number(cached.get("at")) or 0.0
+        if time.time() - stamp <= LIVE_ANCHOR_TTL:
+            return safe_number(cached.get("pe"))
+    try:
+        info = yf.Ticker(etf).get_info()
+        pe = info_number(info if isinstance(info, dict) else {}, "trailingPE")
+        if pe is not None and 3 < pe < 60:
+            cache_put("anchor", etf, {"pe": pe, "at": time.time()})
+            return pe
+    except Exception:
+        pass
+    return None
 
 
 def historical_multiple(data: StockData, kind: str = "pe") -> Optional[float]:
@@ -1747,15 +2053,31 @@ def historical_multiple(data: StockData, kind: str = "pe") -> Optional[float]:
     return float(np.median(multiples)) if len(multiples) >= 3 else None
 
 
-def valuation_targets(data: StockData, peer_medians: dict[str, float]) -> dict[str, float]:
-    """Blend sector anchor, peer median, and the company's own history, then
-    clamp hard so one bad input cannot run away with the valuation."""
-    anchors = sector_profile(data)
+def valuation_targets(data: StockData, peer_medians: dict[str, float],
+                      risk_free: float = ANCHOR_BASE_RF,
+                      live_pe: Optional[float] = None) -> dict[str, float]:
+    """Blend the RATE-ADJUSTED sector anchor, the live sector-ETF multiple,
+    peer medians, and the company's own history, then clamp hard so one bad
+    input cannot run away with the valuation.
+
+    The static table is first translated into the current rate regime (see
+    rate_adjusted_anchors), which matches the rate-awareness of the DCF side:
+    the same 10Y print that sets the WACC now also sets the relative-multiple
+    yardstick, instead of the multiples quietly assuming a 4.2% world."""
+    anchors = rate_adjusted_anchors(sector_profile(data), risk_free)
     own_pe = historical_multiple(data, "pe")
     own_pfcf = historical_multiple(data, "pfcf")
+    live_scale = None
+    if live_pe is not None and anchors.get("pe"):
+        # The ETF P/E re-anchors the earnings multiples; other multiples move
+        # with the same market-level scale factor, damped.
+        live_scale = clamp(live_pe / anchors["pe"], 0.60, 1.60)
     targets: dict[str, float] = {}
     for key, anchor in anchors.items():
         components: list[tuple[float, float]] = [(anchor, 1.0)]
+        if live_scale is not None:
+            damp = 1.0 if key in ("pe", "forward_pe") else 0.5
+            components.append((anchor * (1.0 + (live_scale - 1.0) * damp), 1.0))
         if key in peer_medians:
             components.append((clamp(peer_medians[key], anchor * 0.50, anchor * 1.50), 2.0))
         if key == "pe" and own_pe is not None:
@@ -1875,18 +2197,17 @@ def dcf_per_share(data: StockData, starting_fcff: float, growth: float,
     return divide(equity_value, shares), parts
 
 
-def reverse_dcf(data: StockData, starting_fcff: float,
-                assumptions: MarketAssumptions) -> tuple[Optional[float], str]:
-    """Return implied growth and whether it is exact or outside solver bounds."""
+def reverse_dcf(data: StockData, starting_fcff: float, assumptions: MarketAssumptions) -> Optional[float]:
+    """Solve for the 5-year growth rate the current price implies."""
     price = data.metrics.get("current_price")
     shares = data.metrics.get("effective_shares")
     if not price or not shares or shares <= 0 or starting_fcff is None or starting_fcff <= 0:
-        return None, "unavailable"
+        return None
     target_equity = price * shares
     net_debt = data.metrics.get("net_debt") or 0.0
     target_ev = target_equity + net_debt
     if target_ev <= 0:
-        return None, "unavailable"
+        return None
 
     def value_at(growth: float) -> Optional[float]:
         enterprise_value, _ = dcf_enterprise_value(
@@ -1895,19 +2216,19 @@ def reverse_dcf(data: StockData, starting_fcff: float,
 
     low, high = -0.30, 0.60
     if (value_at(low) or 0) > target_ev:
-        return low, "upper_bound"
+        return low
     if (value_at(high) or 0) < target_ev:
-        return high, "lower_bound"
+        return high
     for _ in range(80):
         mid = (low + high) / 2
         current = value_at(mid)
         if current is None:
-            return None, "unavailable"
+            return None
         if current < target_ev:
             low = mid
         else:
             high = mid
-    return (low + high) / 2, "exact"
+    return (low + high) / 2
 
 
 def normalized_owner_earnings(data: StockData, assumptions: MarketAssumptions) -> tuple[
@@ -2022,6 +2343,7 @@ def estimate_fair_value(
     model_fit: float,
     integrity: float,
     mos_override: Optional[float] = None,
+    band_scale: float = 1.0,
 ) -> FairValueResult:
     m = data.metrics
     analyst_reference = m.get("analyst_target") if (m.get("analyst_target") or 0) > 0 else None
@@ -2034,6 +2356,8 @@ def estimate_fair_value(
         "Analyst price targets are shown for reference only and carry zero weight.",
         f"Risk-free rate {assumptions.risk_free:.2%} ({assumptions.source}); "
         f"WACC {assumptions.wacc:.2%}; terminal growth {assumptions.terminal_growth:.2%}.",
+        f"Sector multiple anchors are rate-adjusted in yield space from a {ANCHOR_BASE_RF:.1%} "
+        f"baseline to the live {assumptions.risk_free:.2%} risk-free rate.",
     ]
 
     def blocked(status: str, action: str, extra: str) -> FairValueResult:
@@ -2108,9 +2432,9 @@ def estimate_fair_value(
             methods.append(ValuationMethod("DCF (FCFF / WACC)", "cash flow", base, min(bear, base), max(bull, base),
                                            1.0, clamp(reliability), note=note))
 
-        dcf.implied_growth, dcf.implied_growth_bound = reverse_dcf(data, starting_fcff, assumptions)
+        dcf.implied_growth = reverse_dcf(data, starting_fcff, assumptions)
         realized = m.get("revenue_cagr3")
-        if dcf.implied_growth is not None and realized is not None and dcf.implied_growth_bound == "exact":
+        if dcf.implied_growth is not None and realized is not None:
             dcf.implied_vs_actual = dcf.implied_growth - realized
 
     # Earnings power value: no growth at all, capitalized in perpetuity. This is
@@ -2192,6 +2516,21 @@ def estimate_fair_value(
     if len(methods) < 2:
         return blocked("INSUFFICIENT DATA", "INSUFFICIENT DATA",
                        "Fewer than two usable valuation methods could be constructed.")
+
+    # ---- Calibrated sensitivity bands ---------------------------------------
+    # Every method's bear/bull half-width above is a hand-set sensitivity
+    # guess (-10% FCFF here, +/-18% there). band_scale is the backtester's
+    # verdict on those guesses: if realized (predicted upside - actual return)
+    # dispersion exceeded the published bands, they widen; if the bands were
+    # padded relative to realized error, they narrow. Applied uniformly so
+    # relative method sensitivities - which ARE structural - are preserved.
+    band_scale = clamp(band_scale, *DCF_BAND_SCALE_RANGE)
+    if band_scale != 1.0:
+        for method in methods:
+            method.bear = max(method.value - (method.value - method.bear) * band_scale,
+                              method.value * 0.10)
+            method.bull = method.value + (method.bull - method.value) * band_scale
+        notes.append(f"Bear/bull bands are scaled {band_scale:.2f}x by backtest calibration.")
 
     # ---- Blend: within family first, then across families -------------------
     families: dict[str, list[ValuationMethod]] = {}
@@ -2341,7 +2680,22 @@ def metric_score(data: StockData, key: str, scorer: Callable[[float], float]) ->
     return clamp(scorer(value)) * (0.85 + 0.15 * reliability)
 
 
-def grouped_category(maximum: float, groups: list[tuple[str, float, list[Optional[float]]]]) -> CategoryResult:
+def grouped_category(maximum: float, groups: list[tuple[str, float, list[Optional[float]]]],
+                     gamma: float = 1.0) -> CategoryResult:
+    """gamma is a backtest-calibrated curve exponent applied to the category's
+    normalized score (score**gamma). The hand-drawn interpolation breakpoints
+    fix each curve's SHAPE from intuition; gamma is the one degree of freedom
+    the backtester is allowed to bend, from out-of-sample evidence only:
+
+        gamma > 1  the category's ranking predicted excess returns, so the
+                   curve steepens - mediocre readings are punished harder and
+                   only genuinely strong readings earn full credit;
+        gamma < 1  the category showed little or no predictive ordering, so
+                   the curve flattens toward indifference and the category's
+                   internal distinctions matter less.
+
+    Clamped to CURVE_GAMMA_RANGE so no sample can invert or degenerate a
+    curve. Identity (1.0) until a validated calibration file says otherwise."""
     earned = 0.0
     available_weight = 0.0
     details: list[str] = []
@@ -2359,14 +2713,21 @@ def grouped_category(maximum: float, groups: list[tuple[str, float, list[Optiona
         return CategoryResult(0.0, maximum, 0.0, details)
     coverage = available_weight / total_weight
     normalized = earned / available_weight
+    gamma = clamp(gamma, *CURVE_GAMMA_RANGE)
+    if gamma != 1.0:
+        normalized = clamp(normalized) ** gamma
+        details.append(f"calibrated curve exponent: {gamma:.2f}")
     # Missing data does not score zero, but it caps the credit available.
     points = maximum * min(normalized, 0.45 + 0.55 * coverage)
     return CategoryResult(points, maximum, coverage, details)
 
 
 def score_categories(data: StockData, targets: dict[str, float], confidence: float,
-                     integrity: float) -> dict[str, CategoryResult]:
+                     integrity: float,
+                     curve_gammas: Optional[dict[str, float]] = None) -> dict[str, CategoryResult]:
     m = data.metrics
+    gammas = curve_gammas or {}
+    g = lambda key: float(gammas.get(key, 1.0))
     margin = lambda v: interpolate(v, [(-0.20, 0), (0, 0.20), (0.05, 0.50), (0.15, 0.80), (0.30, 1.0)])
     gross = lambda v: interpolate(v, [(0.05, 0), (0.20, 0.30), (0.35, 0.60), (0.50, 0.85), (0.70, 1.0)])
     returns = lambda v: interpolate(v, [(-0.20, 0), (0, 0.20), (0.08, 0.55), (0.15, 0.80), (0.25, 1.0)])
@@ -2376,7 +2737,7 @@ def score_categories(data: StockData, targets: dict[str, float], confidence: flo
     low_vol = lambda v: interpolate(v, [(0, 1), (0.25, 0.9), (0.75, 0.55), (1.5, 0.15), (3, 0)])
     liquidity = lambda v: interpolate(v, [(0, 0), (0.8, 0.2), (1.0, 0.45), (1.5, 0.8), (2.5, 1.0), (4.0, 0.85)])
 
-    profitability = grouped_category(CATEGORY_MAXIMUMS["profitability"], [
+    profitability = grouped_category(CATEGORY_MAXIMUMS["profitability"], gamma=g("profitability"), groups=[
         ("gross margin", 0.15, [metric_score(data, "gross_margin", gross)]),
         ("operating margins", 0.25, [metric_score(data, "operating_margin", margin),
                                      metric_score(data, "profit_margin", margin)]),
@@ -2385,7 +2746,7 @@ def score_categories(data: StockData, targets: dict[str, float], confidence: flo
                                             metric_score(data, "return_on_equity", returns)]),
         ("profit consistency", 0.10, [metric_score(data, "income_consistency", steady)]),
     ])
-    growth_result = grouped_category(CATEGORY_MAXIMUMS["growth"], [
+    growth_result = grouped_category(CATEGORY_MAXIMUMS["growth"], gamma=g("growth"), groups=[
         ("revenue growth", 0.30, [metric_score(data, "revenue_growth", growth),
                                   metric_score(data, "revenue_cagr3", growth),
                                   metric_score(data, "revenue_cagr5", growth)]),
@@ -2399,7 +2760,7 @@ def score_categories(data: StockData, targets: dict[str, float], confidence: flo
         ("reinvestment runway", 0.10, [metric_score(data, "capex_to_depreciation",
                                                     lambda v: interpolate(v, [(0.3, 0.3), (1.0, 0.8), (1.5, 1.0), (3.5, 0.5)]))]),
     ])
-    health = grouped_category(CATEGORY_MAXIMUMS["financial_health"], [
+    health = grouped_category(CATEGORY_MAXIMUMS["financial_health"], gamma=g("financial_health"), groups=[
         ("net cash position", 0.25, [metric_score(data, "cash_to_debt",
                                                   lambda v: interpolate(v, [(0, 0), (0.25, 0.25), (0.75, 0.6), (1, 0.8), (2, 1)]))]),
         ("leverage", 0.25, [metric_score(data, "debt_to_equity",
@@ -2413,7 +2774,7 @@ def score_categories(data: StockData, targets: dict[str, float], confidence: flo
         ("working-capital cycle", 0.10, [metric_score(data, "cash_conversion_cycle",
                                                       lambda v: interpolate(v, [(-60, 1), (0, 0.95), (45, 0.75), (90, 0.45), (180, 0.1)]))]),
     ])
-    valuation = grouped_category(CATEGORY_MAXIMUMS["valuation"], [
+    valuation = grouped_category(CATEGORY_MAXIMUMS["valuation"], gamma=g("valuation"), groups=[
         ("earnings multiples", 0.30, [metric_score(data, "trailing_pe", lambda v: score_relative_multiple(v, targets["pe"])),
                                       metric_score(data, "forward_pe", lambda v: score_relative_multiple(v, targets["forward_pe"]))]),
         ("cash-flow multiples", 0.28, [metric_score(data, "price_to_fcf", lambda v: score_relative_multiple(v, targets["pfcf"]))]),
@@ -2423,7 +2784,7 @@ def score_categories(data: StockData, targets: dict[str, float], confidence: flo
         ("owner yield", 0.08, [metric_score(data, "fcf_yield",
                                             lambda v: interpolate(v, [(-0.05, 0), (0, 0.15), (0.03, 0.45), (0.06, 0.75), (0.10, 1.0)]))]),
     ])
-    accounting = grouped_category(CATEGORY_MAXIMUMS["cash_accounting"], [
+    accounting = grouped_category(CATEGORY_MAXIMUMS["cash_accounting"], gamma=g("cash_accounting"), groups=[
         ("cash generation", 0.22, [metric_score(data, "fcf_margin", margin),
                                    metric_score(data, "fcf_consistency", steady)]),
         ("earnings conversion", 0.20, [metric_score(data, "ocf_to_net_income",
@@ -2444,7 +2805,7 @@ def score_categories(data: StockData, targets: dict[str, float], confidence: flo
                                               metric_score(data, "goodwill_to_assets",
                                                            lambda v: interpolate(v, [(0, 1), (0.15, 0.85), (0.35, 0.5), (0.60, 0.15), (1, 0)]))]),
     ])
-    risk = grouped_category(CATEGORY_MAXIMUMS["risk_data"], [
+    risk = grouped_category(CATEGORY_MAXIMUMS["risk_data"], gamma=g("risk_data"), groups=[
         ("data confidence", 0.25, [clamp(confidence / 100)]),
         ("statement integrity", 0.25, [clamp(integrity / 100)]),
         ("price volatility", 0.18, [metric_score(data, "annual_volatility",
@@ -2629,25 +2990,62 @@ def load_category_weights(path: Optional[str]) -> Optional[dict[str, float]]:
     return {key: 100 * value / total for key, value in weights.items()}
 
 
+def load_calibration(path: Optional[str]) -> Optional[Calibration]:
+    """Load a calibration file written by --calibrate-out.
+
+    Also accepts the legacy flat weights-only format for continuity, so an
+    old --weights-json file can be passed to --calibration-json unchanged."""
+    if not path:
+        return None
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("The calibration file must be a JSON object.")
+    if set(payload) == set(CATEGORY_MAXIMUMS):        # legacy weights-only file
+        return Calibration(category_weights=load_category_weights(path), provenance="legacy weights file")
+    weights = None
+    if payload.get("category_weights"):
+        raw = payload["category_weights"]
+        if set(raw) != set(CATEGORY_MAXIMUMS):
+            raise ValueError("category_weights must contain exactly: " + ", ".join(CATEGORY_MAXIMUMS))
+        weights = {k: float(raw[k]) for k in CATEGORY_MAXIMUMS}
+        if any(not math.isfinite(v) or v <= 0 for v in weights.values()):
+            raise ValueError("Every category weight must be a positive finite number.")
+        total = sum(weights.values())
+        weights = {k: 100 * v / total for k, v in weights.items()}
+    gammas = None
+    if payload.get("curve_gamma"):
+        gammas = {str(k): float(clamp(float(v), *CURVE_GAMMA_RANGE))
+                  for k, v in payload["curve_gamma"].items()
+                  if k in CATEGORY_MAXIMUMS and math.isfinite(float(v))}
+    band = payload.get("dcf_band_scale")
+    band = float(clamp(float(band), *DCF_BAND_SCALE_RANGE)) if band is not None and math.isfinite(float(band)) else None
+    return Calibration(category_weights=weights, curve_gamma=gammas, dcf_band_scale=band,
+                       provenance=str(payload.get("meta", {}).get("generated", "calibration file")))
+
+
 def analyze(data: StockData, peer_symbols: list[str],
             category_weights: Optional[dict[str, float]] = None,
             mos_override: Optional[float] = None,
-            risk_free_override: Optional[float] = None) -> AnalysisResult:
-    peer_medians, peers_used = fetch_peer_medians(peer_symbols, data.warnings, data.sector)
+            calibration: Optional[Calibration] = None) -> AnalysisResult:
+    calibration = calibration or Calibration()
+    if category_weights is None:
+        category_weights = calibration.category_weights
+
+    peer_medians, peers_used = fetch_peer_medians(peer_symbols, data.warnings,
+                                                  data.sector, data.industry)
     data.peers_used = peers_used
     data.peer_medians = peer_medians
 
-    if risk_free_override is None:
-        risk_free, rate_source = fetch_risk_free_rate(data.warnings)
-    else:
-        risk_free, rate_source = risk_free_override, "explicit override"
+    risk_free, rate_source = fetch_risk_free_rate(data.warnings)
     assumptions = build_assumptions(data, risk_free, rate_source)
 
     confidence = confidence_score(data)
     coverage, freshness = data_quality_components(data)
     integrity = integrity_score(data)
-    targets = valuation_targets(data, peer_medians)
-    categories = score_categories(data, targets, confidence, integrity)
+    live_pe = fetch_live_anchor_pe(data.sector)
+    targets = valuation_targets(data, peer_medians, risk_free, live_pe)
+    categories = score_categories(data, targets, confidence, integrity,
+                                  curve_gammas=calibration.curve_gamma)
     apply_category_weights(categories, category_weights)
     overall = sum(result.points for result in categories.values())
 
@@ -2659,6 +3057,7 @@ def analyze(data: StockData, peer_symbols: list[str],
     fair_value = estimate_fair_value(
         data, targets, assumptions, confidence, coverage, freshness,
         quality, model_fit, integrity, mos_override,
+        band_scale=calibration.dcf_band_scale if calibration.dcf_band_scale is not None else 1.0,
     )
     model_confidence = fair_value.confidence if fair_value.methods else min(
         40.0, 0.30 * coverage + 0.20 * freshness + 0.20 * model_fit)
@@ -2687,11 +3086,8 @@ def analyze(data: StockData, peer_symbols: list[str],
         direction = ("upside" if (fair_value.upside_downside or 0) >= 0 else "downside")
         implied = ""
         if fair_value.dcf.implied_growth is not None:
-            qualifier = ("at most " if fair_value.dcf.implied_growth_bound == "upper_bound"
-                         else "at least " if fair_value.dcf.implied_growth_bound == "lower_bound"
-                         else "roughly ")
-            implied = (f" At the current price the market is pricing "
-                       f"{qualifier}{fair_value.dcf.implied_growth:.1%} annual cash-flow growth")
+            implied = (f" At the current price the market is pricing roughly "
+                       f"{fair_value.dcf.implied_growth:.1%} annual cash-flow growth")
             if fair_value.dcf.implied_vs_actual is not None:
                 realized = fair_value.dcf.implied_growth - fair_value.dcf.implied_vs_actual
                 implied += f", against {realized:.1%} realized over the last three years"
@@ -2742,14 +3138,6 @@ def price_text(value: Optional[float], currency: str) -> str:
 
 def pct(value: Optional[float], digits: int = 1) -> str:
     return "N/A" if value is None else f"{value:.{digits}%}"
-
-
-def implied_growth_text(detail: DCFDetail) -> str:
-    if detail.implied_growth is None:
-        return "N/A"
-    prefix = ("≤ " if detail.implied_growth_bound == "upper_bound"
-              else "≥ " if detail.implied_growth_bound == "lower_bound" else "")
-    return prefix + pct(detail.implied_growth)
 
 
 def multiple(value: Optional[float]) -> str:
@@ -2871,7 +3259,7 @@ def print_report(data: StockData, result: AnalysisResult, detail: str = "standar
 
     p.line()
     p.box((
-        (f"{data.company_name.upper()} ({data.symbol})  -  VALUATION MODEL V6", "title"),
+        (f"{data.company_name.upper()} ({data.symbol})  -  VALUATION MODEL V5", "title"),
         (f"Current price      {price_text(m.get('current_price'), data.currency)}", None),
         (f"Fair value         {price_text(fv.base, data.currency)}   ({relation})",
          "value" if fv.base is not None else "bad"),
@@ -2912,16 +3300,14 @@ def print_report(data: StockData, result: AnalysisResult, detail: str = "standar
                        else "the market demands less growth than recently delivered" if gap < -0.02
                        else "the market is roughly extrapolating recent growth")
         p.key_values((
-            ("Implied 5Y cash-flow growth", implied_growth_text(fv.dcf), "value"),
+            ("Implied 5Y cash-flow growth", pct(fv.dcf.implied_growth), "value"),
             ("Realized revenue CAGR 3Y / 5Y", f"{pct(realized3)} / {pct(realized5)}", None),
             ("Implied minus realized", pct(gap) if gap is not None else "N/A",
              "bad" if (gap or 0) > 0.05 else "good"),
             ("Reading", verdict, "neutral"),
         ))
-        explanation = ("The exact solution lies outside the displayed solver range."
-                       if fv.dcf.implied_growth_bound != "exact"
-                       else "This is the growth rate that makes today's price exactly fair under the stated WACC and terminal growth.")
-        p.wrapped(explanation, tone="dim")
+        p.wrapped("This is the most falsifiable figure in the report: it is the growth rate that makes "
+                  "today's price exactly fair under the stated WACC and terminal growth.", tone="dim")
     else:
         p.wrapped("A reverse DCF could not be solved (non-positive or unavailable owner cash flow).", tone="dim")
 
@@ -3041,6 +3427,17 @@ def print_report(data: StockData, result: AnalysisResult, detail: str = "standar
         if not data.integrity:
             p.wrapped("No integrity check could be run with the available statements.", tone="dim")
 
+        p.section("Cross-source validation")
+        if data.validation:
+            for check in data.validation:
+                prefix = {"confirmed": "OK    ", "review": "?     ", "conflict": "FAIL  "}[check.verdict]
+                tone = {"confirmed": "good", "review": "neutral", "conflict": "bad"}[check.verdict]
+                p.wrapped(f"{check.key}: {price_text(check.primary, data.currency) if check.key == 'current_price' else money(check.primary, data.currency)} "
+                          f"vs {check.source} - {check.detail}", prefix=prefix, tone=tone)
+        else:
+            p.wrapped("No secondary source was available for this symbol (non-US filer, "
+                      "non-USD statements, network failure, or --no-secondary).", tone="dim")
+
         p.section("Valuation diagnostics")
         for item in dict.fromkeys(fv.diagnostics) or ["No valuation diagnostic was triggered."]:
             p.wrapped(item, prefix="! ", tone="bad" if fv.base is None else "neutral")
@@ -3131,7 +3528,6 @@ def result_to_dict(data: StockData, result: AnalysisResult) -> dict[str, Any]:
         },
         "reverse_dcf": {
             "implied_growth": fv.dcf.implied_growth,
-            "bound": fv.dcf.implied_growth_bound,
             "realized_revenue_cagr3": data.metrics.get("revenue_cagr3"),
             "realized_revenue_cagr5": data.metrics.get("revenue_cagr5"),
             "implied_minus_realized": fv.dcf.implied_vs_actual,
@@ -3171,6 +3567,7 @@ def result_to_dict(data: StockData, result: AnalysisResult) -> dict[str, Any]:
                     for mt in fv.methods],
         "family_values": fv.family_values,
         "integrity_checks": [asdict(c) for c in data.integrity],
+        "cross_source_validation": [asdict(c) for c in data.validation],
         "strengths": result.strengths,
         "concerns": result.concerns,
         "diagnostics": list(dict.fromkeys(fv.diagnostics)),
@@ -3184,7 +3581,8 @@ SNAPSHOT_FIELDS = [
     "confidence", "data_coverage", "data_freshness", "statement_integrity", "model_fit",
     "model_confidence", "cross_family_agreement", "fair_value", "buy_below",
     "margin_of_safety", "upside_downside", "discount_premium", "valuation_status",
-    "action", "implied_growth", "implied_growth_bound", "realized_cagr3", "piotroski_f", "altman_z", "beneish_m",
+    "action", "implied_growth", "realized_cagr3", "piotroski_f", "altman_z", "beneish_m",
+    "bear", "bull",
     *[f"cat_{key}" for key in CATEGORY_MAXIMUMS],
     "future_return", "benchmark_return",
 ]
@@ -3193,9 +3591,23 @@ SNAPSHOT_FIELDS = [
 def append_snapshot(path: str, data: StockData, result: AnalysisResult) -> None:
     """Point-in-time record. Downloading today's fundamentals for an old date
     would be look-ahead bias, so the only valid backtest is one accumulated
-    forward, one run at a time."""
+    forward, one run at a time.
+
+    If the file already exists with an older column set, its header wins and
+    new columns are silently dropped for that file - never corrupt an
+    accumulating history by shifting columns mid-file."""
     destination = Path(path)
     exists = destination.exists()
+    fieldnames = SNAPSHOT_FIELDS
+    if exists:
+        try:
+            with destination.open("r", newline="", encoding="utf-8") as handle:
+                first = handle.readline().strip()
+            existing = [c.strip() for c in first.split(",")] if first else []
+            if existing and "date" in existing:
+                fieldnames = existing
+        except OSError:
+            pass
     fv, f = result.fair_value, data.forensics
     row = {
         "date": data.retrieved_at.date().isoformat(), "ticker": data.symbol,
@@ -3210,15 +3622,15 @@ def append_snapshot(path: str, data: StockData, result: AnalysisResult) -> None:
         "buy_below": fv.buy_below, "margin_of_safety": fv.margin_of_safety,
         "upside_downside": fv.upside_downside, "discount_premium": fv.discount_premium,
         "valuation_status": fv.status, "action": fv.action,
-        "implied_growth": fv.dcf.implied_growth, "implied_growth_bound": fv.dcf.implied_growth_bound,
-        "realized_cagr3": data.metrics.get("revenue_cagr3"),
+        "implied_growth": fv.dcf.implied_growth, "realized_cagr3": data.metrics.get("revenue_cagr3"),
         "piotroski_f": f.piotroski, "altman_z": f.altman_z, "beneish_m": f.beneish_m,
+        "bear": fv.low, "bull": fv.high,
         "future_return": "", "benchmark_return": "",
     }
     for key, category in result.categories.items():
         row[f"cat_{key}"] = round(100 * category.points / category.maximum, 4) if category.maximum else ""
     with destination.open("a", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=SNAPSHOT_FIELDS)
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore", restval="")
         if not exists:
             writer.writeheader()
         writer.writerow(row)
@@ -3266,21 +3678,9 @@ def run_backtest(path: str, calibrate_out: Optional[str] = None) -> int:
         return 1
 
     frame["excess_return"] = frame["future_return"]
-    return_basis = "absolute return (no benchmark observations supplied)"
     if "benchmark_return" in frame:
         benchmark = pd.to_numeric(frame["benchmark_return"], errors="coerce")
-        matched = benchmark.notna()
-        if matched.any():
-            omitted = int((~matched).sum())
-            if omitted:
-                print(f"Excluded {omitted} row(s) without benchmark returns; absolute and excess returns are never mixed.")
-            frame = frame.loc[matched].copy()
-            benchmark = benchmark.loc[matched]
-            frame["excess_return"] = frame["future_return"] - benchmark
-            return_basis = "benchmark-relative excess return"
-            if len(frame) < 20:
-                print("At least 20 observations with matched benchmark returns are required.")
-                return 1
+        frame["excess_return"] = frame["future_return"] - benchmark.fillna(0)
 
     dates = frame["date"].nunique() if "date" in frame.columns else len(frame)
     tickers = frame["ticker"].nunique() if "ticker" in frame.columns else len(frame)
@@ -3296,7 +3696,6 @@ def run_backtest(path: str, calibrate_out: Optional[str] = None) -> int:
 
     print("\nPOINT-IN-TIME CALIBRATION REPORT")
     print(f"Observations:              {len(frame)}")
-    print(f"Return basis:              {return_basis}")
     print(f"Distinct dates / tickers:  {dates} / {tickers}")
     print(f"Spearman rank correlation: {spearman: .3f}")
     if math.isfinite(lower):
@@ -3339,13 +3738,52 @@ def run_backtest(path: str, calibrate_out: Optional[str] = None) -> int:
             correlations[key] = corr
             print(f"  {key:<22}{corr: .3f}" if math.isfinite(corr) else f"  {key:<22} insufficient data")
 
+    # Realized-error check on the published bear/bull bands: compare the
+    # dispersion of (realized return - predicted upside) against the half-width
+    # of the bands the model published on those same dates. Robust spread
+    # (MAD-based) by date block, so one crash date cannot set the scale.
+    band_scale: Optional[float] = None
+    band_columns = {"bear", "bull", "fair_value", "upside_downside"}
+    if band_columns.issubset(frame.columns):
+        numeric = {c: pd.to_numeric(frame[c], errors="coerce") for c in band_columns}
+        half_band = ((numeric["bull"] - numeric["bear"]) / (2 * numeric["fair_value"])).replace(
+            [np.inf, -np.inf], np.nan)
+        residual = (frame["future_return"] - numeric["upside_downside"]).replace(
+            [np.inf, -np.inf], np.nan)
+        valid = pd.DataFrame({"half_band": half_band, "residual": residual,
+                              "date": frame.get("date")}).dropna(subset=["half_band", "residual"])
+        valid = valid[valid["half_band"] > 0.01]
+        if len(valid) >= 30 and valid["date"].nunique() >= 8:
+            mad = float((valid["residual"] - valid["residual"].median()).abs().median())
+            robust_spread = 1.4826 * mad
+            median_band = float(valid["half_band"].median())
+            if median_band > 0 and math.isfinite(robust_spread):
+                band_scale = float(clamp(robust_spread / median_band, *DCF_BAND_SCALE_RANGE))
+                verdict = ("too narrow - widen" if band_scale > 1.15
+                           else "too wide - narrow" if band_scale < 0.85 else "about right")
+                print(f"\nSensitivity-band check: realized robust error {robust_spread:.1%} vs "
+                      f"published half-band {median_band:.1%} -> band scale {band_scale:.2f} ({verdict}).")
+        else:
+            print("\nSensitivity-band check: not enough bear/bull observations yet "
+                  "(needs 30+ rows across 8+ dates with the bear/bull columns filled).")
+
+    # Curve-shape signal per category: the rank correlation earned above maps
+    # to a curve exponent. Strong ordering steepens the curve; absent ordering
+    # flattens it. This is intentionally the ONLY shape parameter fitted -
+    # fitting individual breakpoints to a sample this small would be pure
+    # curve-fitting.
+    curve_gamma: dict[str, float] = {}
+    for key, corr in correlations.items():
+        if math.isfinite(corr):
+            curve_gamma[key] = round(float(clamp(1.0 + 2.5 * (corr - 0.05), *CURVE_GAMMA_RANGE)), 4)
+
     if calibrate_out:
         if dates < 20 or len(frame) < 200:
-            print("\nRefusing to emit calibrated weights: at least 200 observations across 20 distinct "
-                  "dates are required. Fitting weights on less than that is curve-fitting, not calibration.")
+            print("\nRefusing to emit a calibration file: at least 200 observations across 20 distinct "
+                  "dates are required. Fitting parameters on less than that is curve-fitting, not calibration.")
             return 1
         if set(correlations) != set(CATEGORY_MAXIMUMS) or not any(math.isfinite(v) for v in correlations.values()):
-            print("\nCould not build calibrated weights: every category column needs enough observations.")
+            print("\nCould not build a calibration file: every category column needs enough observations.")
             return 1
         signals = {k: max(correlations[k], 0.02) if math.isfinite(correlations[k]) else 0.02
                    for k in CATEGORY_MAXIMUMS}
@@ -3353,9 +3791,22 @@ def run_backtest(path: str, calibrate_out: Optional[str] = None) -> int:
         candidate = {k: clamp(100 * v / total, 5.0, 30.0) for k, v in signals.items()}
         renorm = sum(candidate.values())
         candidate = {k: round(100 * v / renorm, 4) for k, v in candidate.items()}
-        Path(calibrate_out).write_text(json.dumps(candidate, indent=2) + "\n", encoding="utf-8")
-        print(f"\nCandidate weights written to {calibrate_out}. Validate them on a separate holdout "
-              "of dates AND tickers before passing --weights-json.")
+        payload = {
+            "meta": {
+                "generated": datetime.now().astimezone().isoformat(),
+                "observations": int(len(frame)),
+                "distinct_dates": int(dates),
+                "distinct_tickers": int(tickers),
+                "spearman": round(float(spearman), 4) if math.isfinite(spearman) else None,
+                "note": "Validate on a holdout of separate dates AND tickers before use.",
+            },
+            "category_weights": candidate,
+            "curve_gamma": {k: curve_gamma.get(k, 1.0) for k in CATEGORY_MAXIMUMS},
+            "dcf_band_scale": band_scale if band_scale is not None else 1.0,
+        }
+        Path(calibrate_out).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        print(f"\nCalibration written to {calibrate_out} (weights + curve exponents + band scale). "
+              "Validate it on a separate holdout of dates AND tickers before passing --calibration-json.")
 
     if not math.isfinite(spearman) or spearman < 0.10 or spread <= 0:
         print("\nCalibration warning: the score ordering has weak or negative out-of-sample evidence here. "
@@ -3488,7 +3939,7 @@ def self_test() -> int:
     check("WACC is between the bounds", MIN_WACC <= assumptions.wacc <= MAX_WACC)
     check("terminal growth is below WACC", assumptions.terminal_growth < assumptions.wacc)
 
-    result = analyze(data, [], None, None, risk_free_override=0.042)
+    result = analyze(data, [], None, None)
     fv = result.fair_value
     check("fair value issued", fv.base is not None, f"(action {fv.action})")
     if fv.base is not None:
@@ -3512,10 +3963,123 @@ def self_test() -> int:
     expensive = _synthetic_company()
     put_metric(expensive, "current_price", 200.0, "market quote", "current", None, 0.98)
     derive_metrics(expensive)
-    expensive_result = analyze(expensive, [], None, None, risk_free_override=0.042)
+    expensive_result = analyze(expensive, [], None, None)
     check("a 10x higher price reads as overvalued",
           "OVER" in expensive_result.fair_value.status or "ABOVE" in expensive_result.fair_value.action,
           f"(got {expensive_result.fair_value.status} / {expensive_result.fair_value.action})")
+
+    print("\nRate-sensitive anchors")
+    base_anchors = SECTOR_PROFILES["technology"].copy()
+    at_base = rate_adjusted_anchors(base_anchors, ANCHOR_BASE_RF)
+    check("no adjustment at the baseline rate",
+          all(abs(at_base[k] - base_anchors[k]) < 1e-9 for k in base_anchors))
+    higher = rate_adjusted_anchors(base_anchors, ANCHOR_BASE_RF + 0.02)
+    lower = rate_adjusted_anchors(base_anchors, ANCHOR_BASE_RF - 0.02)
+    check("higher rates compress the P/E anchor", higher["pe"] < base_anchors["pe"])
+    check("lower rates expand the P/E anchor", lower["pe"] > base_anchors["pe"])
+    check("long-duration multiples move more than short",
+          (base_anchors["pe"] - higher["pe"]) / base_anchors["pe"]
+          > (base_anchors["ev_ebitda"] - higher["ev_ebitda"]) / base_anchors["ev_ebitda"])
+    check("P/S moves less than P/E",
+          (base_anchors["ps"] - higher["ps"]) / base_anchors["ps"]
+          < (base_anchors["pe"] - higher["pe"]) / base_anchors["pe"])
+    extreme = rate_adjusted_anchors(base_anchors, 0.15)
+    check("rate adjustment respects the clamp",
+          all(extreme[k] >= base_anchors[k] * ANCHOR_RATE_CLAMP[0] - 1e-9 for k in base_anchors))
+
+    print("\nCalibrated curve exponents")
+    groups = [("only", 1.0, [0.6])]
+    neutral = grouped_category(10.0, groups).points
+    steep = grouped_category(10.0, groups, gamma=1.5).points
+    flat = grouped_category(10.0, groups, gamma=0.7).points
+    check("gamma of 1 is the identity", abs(neutral - 6.0) < 1e-9, f"(got {neutral})")
+    check("gamma above 1 penalizes a mediocre score", steep < neutral)
+    check("gamma below 1 lifts a mediocre score", flat > neutral)
+    check("a perfect score survives any gamma",
+          abs(grouped_category(10.0, [("only", 1.0, [1.0])], gamma=1.5).points - 10.0) < 1e-9)
+
+    print("\nCalibrated DCF sensitivity bands")
+    wide = analyze(data, [], None, None, Calibration(dcf_band_scale=1.8))
+    narrow = analyze(data, [], None, None, Calibration(dcf_band_scale=0.7))
+    if None not in (fv.base, wide.fair_value.base, narrow.fair_value.base):
+        base_spread = fv.high - fv.low
+        check("a band scale above 1 widens bear/bull",
+              wide.fair_value.high - wide.fair_value.low > base_spread)
+        check("a band scale below 1 narrows bear/bull",
+              narrow.fair_value.high - narrow.fair_value.low < base_spread)
+        check("the base fair value is unmoved by band scaling",
+              abs(wide.fair_value.base - fv.base) / fv.base < 0.02,
+              f"(got {wide.fair_value.base} vs {fv.base})")
+
+    print("\nCross-source validation mechanics")
+    validated = _synthetic_company()
+    rel_before = validated.meta["revenue"].reliability
+    _apply_validation(validated, "revenue", 1000.0, 1005.0, "self-test source")
+    check("a confirming source raises reliability",
+          validated.meta["revenue"].reliability > rel_before
+          and validated.validation[-1].verdict == "confirmed")
+    rel_before = validated.meta["net_income"].reliability
+    _apply_validation(validated, "net_income", 130.0, 210.0, "self-test source")
+    check("a conflicting source cuts reliability hard",
+          validated.meta["net_income"].reliability < rel_before * 0.7
+          and validated.validation[-1].verdict == "conflict")
+    check("a conflict is surfaced as a warning",
+          any("Cross-source conflict" in w for w in validated.warnings))
+    _apply_validation(validated, "ocf", 190.0, 170.0, "self-test source")
+    check("a middling gap is flagged for review, not punished",
+          validated.validation[-1].verdict == "review")
+
+    print("\nCalibration round-trip and backtest emission")
+    import contextlib
+    import io
+    with tempfile.TemporaryDirectory() as workdir:
+        legacy_path = Path(workdir) / "legacy.json"
+        legacy_path.write_text(json.dumps({k: v for k, v in CATEGORY_MAXIMUMS.items()}), encoding="utf-8")
+        legacy = load_calibration(str(legacy_path))
+        check("legacy weights file loads as a calibration",
+              legacy is not None and legacy.category_weights is not None
+              and legacy.curve_gamma is None)
+
+        rng = np.random.default_rng(11)
+        rows = []
+        for day in range(24):
+            date = f"2026-{1 + day // 28:02d}-{1 + day % 28:02d}"
+            for t in range(10):
+                score = float(rng.uniform(5, 95))
+                ret = 0.004 * (score - 50) + float(rng.normal(0, 0.08))
+                row = {"date": date, "ticker": f"T{t}", "score": score,
+                       "future_return": ret, "benchmark_return": 0.0,
+                       "fair_value": 100.0, "bear": 82.0, "bull": 118.0,
+                       "upside_downside": float(rng.normal(0.02, 0.05)),
+                       "discount_premium": 0.0, "implied_growth": 0.05,
+                       "piotroski_f": 5, "business_quality": score}
+                for key in CATEGORY_MAXIMUMS:
+                    row[f"cat_{key}"] = clamp(score + float(rng.normal(0, 18)), 0, 100)
+                rows.append(row)
+        history_path = Path(workdir) / "history.csv"
+        pd.DataFrame(rows).to_csv(history_path, index=False)
+        calib_path = Path(workdir) / "calib.json"
+        with contextlib.redirect_stdout(io.StringIO()):
+            status = run_backtest(str(history_path), str(calib_path))
+        check("backtest emits a calibration file", status == 0 and calib_path.exists())
+        if calib_path.exists():
+            calibration = load_calibration(str(calib_path))
+            check("calibration file carries weights, gammas, and a band scale",
+                  calibration is not None
+                  and calibration.category_weights is not None
+                  and calibration.curve_gamma is not None
+                  and calibration.dcf_band_scale is not None)
+            if calibration and calibration.curve_gamma:
+                check("emitted gammas respect the clamp",
+                      all(CURVE_GAMMA_RANGE[0] <= v <= CURVE_GAMMA_RANGE[1]
+                          for v in calibration.curve_gamma.values()))
+            if calibration and calibration.dcf_band_scale is not None:
+                check("emitted band scale respects the clamp",
+                      DCF_BAND_SCALE_RANGE[0] <= calibration.dcf_band_scale <= DCF_BAND_SCALE_RANGE[1])
+
+    print("\nPeer weighting mechanics")
+    check("weighted median favors the full-weight side",
+          weighted_median([(10.0, 1.0), (30.0, 0.5), (10.0, 1.0)]) == 10.0)
 
     print(f"\n{'ALL CHECKS PASSED' if not failures else str(len(failures)) + ' CHECK(S) FAILED: ' + ', '.join(failures)}")
     return 0 if not failures else 1
@@ -3528,7 +4092,8 @@ def self_test() -> int:
 def analyze_symbol(symbol: str, peers: list[str], snapshot_csv: Optional[str],
                    weights_path: Optional[str] = None, detail: str = "standard",
                    use_color: bool = False, as_json: bool = False,
-                   mos_override: Optional[float] = None) -> int:
+                   mos_override: Optional[float] = None,
+                   calibration_path: Optional[str] = None) -> int:
     try:
         cleaned = validate_ticker(symbol)
         validated = [validate_ticker(peer) for peer in peers]
@@ -3537,7 +4102,8 @@ def analyze_symbol(symbol: str, peers: list[str], snapshot_csv: Optional[str],
             print(f"Retrieving point-in-time data for {cleaned}...")
         data = fetch_stock_data(cleaned)
         weights = load_category_weights(weights_path)
-        result = analyze(data, peers, weights, mos_override)
+        calibration = load_calibration(calibration_path)
+        result = analyze(data, peers, weights, mos_override, calibration)
         if as_json:
             print(json.dumps(result_to_dict(data, result), default=_json_default, indent=2))
         else:
@@ -3554,40 +4120,37 @@ def analyze_symbol(symbol: str, peers: list[str], snapshot_csv: Optional[str],
             print(json.dumps({"error": f"{type(exc).__name__}: {exc}"}))
         else:
             print(f"Unexpected provider or model error: {type(exc).__name__}: {exc}")
-            print("No rating was fabricated. Re-run with --debug to distinguish provider failures from model defects.")
-        if DEBUG_MODE:
-            traceback.print_exc(file=sys.stderr)
+            print("The provider may have changed a field name. No rating was fabricated.")
     return 1
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Fundamental equity valuation model V6: fair value, buy-below price, and verdict.")
+        description="Fundamental equity valuation model V5: fair value, buy-below price, and verdict.")
     parser.add_argument("--ticker", help="Ticker to analyze, for example AAPL")
     parser.add_argument("--peers", default="", help="Comma-separated peer tickers for relative multiples")
     parser.add_argument("--mos", type=float, help="Override the required margin of safety, e.g. 0.30")
     parser.add_argument("--snapshot-csv", help="Append today's point-in-time record for later backtesting")
     parser.add_argument("--backtest-csv", help="Evaluate completed point-in-time observations")
-    parser.add_argument("--calibrate-out", help="With --backtest-csv, write candidate category weights")
-    parser.add_argument("--weights-json", help="Apply previously validated category weights")
-    parser.add_argument("--config-json", help="Override documented model assumptions and valuation profiles")
+    parser.add_argument("--calibrate-out", help="With --backtest-csv, write a full calibration file "
+                                                "(category weights + curve exponents + DCF band scale)")
+    parser.add_argument("--weights-json", help="Apply previously validated category weights (legacy format)")
+    parser.add_argument("--calibration-json", help="Apply a validated calibration file from --calibrate-out")
+    parser.add_argument("--no-secondary", action="store_true",
+                        help="Skip Stooq/SEC EDGAR cross-source validation")
     parser.add_argument("--detail", choices=REPORT_DETAILS, default="standard", help="Report depth")
     parser.add_argument("--json", action="store_true", help="Emit machine-readable JSON")
     parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors")
     parser.add_argument("--no-cache", action="store_true", help="Bypass the on-disk provider cache")
     parser.add_argument("--clear-cache", action="store_true", help="Delete cached provider data and exit")
     parser.add_argument("--self-test", action="store_true", help="Run offline checks and exit")
-    parser.add_argument("--debug", action="store_true", help="Print tracebacks for unexpected internal errors")
     args = parser.parse_args()
 
-    global CACHE_ENABLED, DEBUG_MODE
-    DEBUG_MODE = args.debug
-    try:
-        load_model_config(args.config_json)
-    except ConfigurationError as exc:
-        parser.error(str(exc))
+    global CACHE_ENABLED, SECONDARY_ENABLED
     if args.no_cache:
         CACHE_ENABLED = False
+    if args.no_secondary:
+        SECONDARY_ENABLED = False
     if args.clear_cache:
         print(f"Cleared {clear_cache()} cached file(s) from {CACHE_DIR}.")
         return 0
@@ -3601,14 +4164,15 @@ def main() -> int:
         peers = [item.strip().upper() for item in args.peers.split(",") if item.strip()]
         return analyze_symbol(args.ticker, peers, args.snapshot_csv, args.weights_json,
                               detail=args.detail, use_color=use_color, as_json=args.json,
-                              mos_override=args.mos)
+                              mos_override=args.mos, calibration_path=args.calibration_json)
     try:
         ticker = input("Enter a stock ticker symbol: ").strip()
     except (EOFError, KeyboardInterrupt):
         return 0
     while ticker:
         analyze_symbol(ticker, [], args.snapshot_csv, args.weights_json,
-                       detail=args.detail, use_color=use_color, mos_override=args.mos)
+                       detail=args.detail, use_color=use_color, mos_override=args.mos,
+                       calibration_path=args.calibration_json)
         try:
             ticker = input("\nEnter another ticker, or press Enter to exit: ").strip()
         except (EOFError, KeyboardInterrupt):
