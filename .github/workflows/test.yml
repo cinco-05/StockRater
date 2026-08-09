@@ -1,4 +1,4 @@
-# Save as .github/workflows/ci.yml in your repo
+# Save as .github/workflows/test.yml (replace your existing one)
 name: test
 
 on:
@@ -19,7 +19,12 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: pip install yfinance pandas numpy
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
 
       - name: Run self-test (offline, no network needed)
-        run: python stock_analyzer_v5.py --self-test
+        run: python stock_analyzer.py --self-test
+
+      - name: Run pytest
+        run: pytest tests/ -v
