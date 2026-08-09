@@ -4280,8 +4280,8 @@ def self_test() -> int:
           abs(grouped_category(10.0, [("only", 1.0, [1.0])], gamma=1.5).points - 10.0) < 1e-9)
 
     print("\nCalibrated DCF sensitivity bands")
-    wide = analyze(data, [], None, None, Calibration(dcf_band_scale=1.8))
-    narrow = analyze(data, [], None, None, Calibration(dcf_band_scale=0.7))
+    wide = analyze(data, [], None, None, Calibration(dcf_band_scale=1.8), risk_free_override=0.042)
+    narrow = analyze(data, [], None, None, Calibration(dcf_band_scale=0.7), risk_free_override=0.042)
     if None not in (fv.base, wide.fair_value.base, narrow.fair_value.base):
         base_spread = fv.high - fv.low
         check("a band scale above 1 widens bear/bull",
