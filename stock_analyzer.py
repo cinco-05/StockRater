@@ -112,6 +112,7 @@ import sys
 import tempfile
 import textwrap
 import time
+import traceback
 import urllib.error
 import urllib.request
 from dataclasses import asdict, dataclass, field, is_dataclass
@@ -165,9 +166,11 @@ MIN_CATEGORY_COVERAGE = 0.40
 MAX_FAMILY_RATIO = 3.0               # across-family high/low above this -> no point estimate
 MAX_TERMINAL_SHARE = 0.80            # terminal value share of EV above this -> flagged
 
+CACHE_SCHEMA_VERSION = 2
 CACHE_DIR = Path(os.environ.get("SAV5_CACHE", Path(tempfile.gettempdir()) / "stock_analyzer_v5"))
 CACHE_TTL_SECONDS = int(os.environ.get("SAV5_CACHE_TTL", 6 * 60 * 60))
 CACHE_ENABLED = True
+DEBUG_MODE = False
 
 CATEGORY_MAXIMUMS = {
     "profitability": 20.0,
@@ -251,6 +254,109 @@ DCF_BAND_SCALE_RANGE = (0.60, 2.00)  # bear/bull half-width multiplier
 
 class StockDataError(RuntimeError):
     """Raised when no defensible analysis can be produced for a symbol."""
+
+
+class ConfigurationError(ValueError):
+    """Raised when a model configuration file is unsafe or invalid."""
+
+
+CONFIGURABLE_DEFAULTS: dict[str, float | int] = {
+    "default_risk_free": DEFAULT_RISK_FREE,
+    "equity_risk_premium": EQUITY_RISK_PREMIUM,
+    "min_cost_of_equity": MIN_COST_OF_EQUITY,
+    "max_cost_of_equity": MAX_COST_OF_EQUITY,
+    "min_wacc": MIN_WACC,
+    "max_wacc": MAX_WACC,
+    "terminal_spread_to_rf": TERMINAL_SPREAD_TO_RF,
+    "min_terminal_growth": MIN_TERMINAL_GROWTH,
+    "max_terminal_growth": MAX_TERMINAL_GROWTH,
+    "explicit_years": EXPLICIT_YEARS,
+    "fade_years": FADE_YEARS,
+    "statutory_tax_fallback": STATUTORY_TAX_FALLBACK,
+    "max_family_ratio": MAX_FAMILY_RATIO,
+    "max_terminal_share": MAX_TERMINAL_SHARE,
+}
+
+CONFIG_GLOBALS = {key: key.upper() for key in CONFIGURABLE_DEFAULTS}
+
+
+def load_model_config(path: Optional[str]) -> None:
+    """Apply validated JSON overrides to documented model defaults."""
+    if not path:
+        return
+    source = Path(path)
+    try:
+        payload = json.loads(source.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigurationError(f"Could not read model configuration: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ConfigurationError("Model configuration must be a JSON object.")
+
+    unknown = set(payload) - {"model", "family_weights", "sector_profiles"}
+    if unknown:
+        raise ConfigurationError("Unknown configuration section(s): " + ", ".join(sorted(unknown)))
+
+    model = payload.get("model", {})
+    if not isinstance(model, dict):
+        raise ConfigurationError("The 'model' section must be an object.")
+    unknown_model = set(model) - set(CONFIGURABLE_DEFAULTS)
+    if unknown_model:
+        raise ConfigurationError("Unknown model setting(s): " + ", ".join(sorted(unknown_model)))
+
+    parsed_model: dict[str, float | int] = {}
+    for key, value in model.items():
+        number = safe_number(value)
+        if number is None:
+            raise ConfigurationError(f"Model setting '{key}' must be finite and numeric.")
+        if key in {"explicit_years", "fade_years"}:
+            if not float(number).is_integer() or number < 1:
+                raise ConfigurationError(f"Model setting '{key}' must be a positive integer.")
+            parsed_model[key] = int(number)
+        else:
+            parsed_model[key] = number
+
+    candidate = {**CONFIGURABLE_DEFAULTS, **parsed_model}
+    if candidate["fade_years"] > candidate["explicit_years"]:
+        raise ConfigurationError("fade_years cannot exceed explicit_years.")
+    if candidate["min_wacc"] > candidate["max_wacc"]:
+        raise ConfigurationError("min_wacc cannot exceed max_wacc.")
+    if candidate["min_terminal_growth"] > candidate["max_terminal_growth"]:
+        raise ConfigurationError("min_terminal_growth cannot exceed max_terminal_growth.")
+    if candidate["min_wacc"] <= candidate["max_terminal_growth"]:
+        raise ConfigurationError("min_wacc must exceed max_terminal_growth.")
+
+    parsed_family: Optional[dict[str, float]] = None
+    family = payload.get("family_weights")
+    if family is not None:
+        if not isinstance(family, dict) or set(family) != set(FAMILY_WEIGHTS):
+            raise ConfigurationError("family_weights must specify cash flow, earnings, asset, and market.")
+        values = {str(key): safe_number(value) for key, value in family.items()}
+        if any(value is None or value <= 0 for value in values.values()):
+            raise ConfigurationError("Every family weight must be positive.")
+        total = sum(float(value) for value in values.values() if value is not None)
+        parsed_family = {key: float(value) / total for key, value in values.items() if value is not None}
+
+    parsed_sectors: dict[str, dict[str, float]] = {}
+    sectors = payload.get("sector_profiles")
+    if sectors is not None:
+        if not isinstance(sectors, dict):
+            raise ConfigurationError("sector_profiles must be an object.")
+        required = set(SECTOR_PROFILES["default"])
+        for sector, profile in sectors.items():
+            if not isinstance(profile, dict) or set(profile) != required:
+                raise ConfigurationError(f"Sector '{sector}' must define: {', '.join(sorted(required))}.")
+            values = {key: safe_number(value) for key, value in profile.items()}
+            if any(value is None or value <= 0 for value in values.values()):
+                raise ConfigurationError(f"Sector '{sector}' contains a non-positive multiple.")
+            parsed_sectors[str(sector).lower()] = {
+                key: float(value) for key, value in values.items() if value is not None
+            }
+
+    for key, value in parsed_model.items():
+        globals()[CONFIG_GLOBALS[key]] = value
+    if parsed_family is not None:
+        FAMILY_WEIGHTS.update(parsed_family)
+    SECTOR_PROFILES.update(parsed_sectors)
 
 
 # --------------------------------------------------------------------------
@@ -395,8 +501,16 @@ def cache_get(namespace: str, key: str) -> Optional[Any]:
         if not path.exists() or (time.time() - path.stat().st_mtime) > CACHE_TTL_SECONDS:
             return None
         with path.open("r", encoding="utf-8") as handle:
-            return _decode(json.load(handle))
-    except Exception:
+            envelope = json.load(handle)
+        if not isinstance(envelope, dict) or envelope.get("schema") != CACHE_SCHEMA_VERSION:
+            path.unlink(missing_ok=True)
+            return None
+        return _decode(envelope.get("payload"))
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
         return None
 
 
@@ -408,9 +522,9 @@ def cache_put(namespace: str, key: str, value: Any) -> None:
         path = _cache_path(namespace, key)
         tmp = path.with_suffix(".tmp")
         with tmp.open("w", encoding="utf-8") as handle:
-            json.dump(_encode(value), handle)
+            json.dump({"schema": CACHE_SCHEMA_VERSION, "payload": _encode(value)}, handle)
         tmp.replace(path)
-    except Exception:
+    except (OSError, TypeError, ValueError):
         pass  # cache is best-effort and must never break analysis
 
 
@@ -559,6 +673,7 @@ class DCFDetail:
     equity_value: Optional[float] = None
     per_share: Optional[float] = None
     implied_growth: Optional[float] = None        # reverse DCF
+    implied_growth_bound: str = "unavailable"     # exact | lower_bound | upper_bound
     implied_vs_actual: Optional[float] = None     # implied minus realized 3Y
 
 
@@ -2218,17 +2333,18 @@ def dcf_per_share(data: StockData, starting_fcff: float, growth: float,
     return divide(equity_value, shares), parts
 
 
-def reverse_dcf(data: StockData, starting_fcff: float, assumptions: MarketAssumptions) -> Optional[float]:
-    """Solve for the 5-year growth rate the current price implies."""
+def reverse_dcf(data: StockData, starting_fcff: float,
+                assumptions: MarketAssumptions) -> tuple[Optional[float], str]:
+    """Return implied growth and whether it is exact or outside solver bounds."""
     price = data.metrics.get("current_price")
     shares = data.metrics.get("effective_shares")
     if not price or not shares or shares <= 0 or starting_fcff is None or starting_fcff <= 0:
-        return None
+        return None, "unavailable"
     target_equity = price * shares
     net_debt = data.metrics.get("net_debt") or 0.0
     target_ev = target_equity + net_debt
     if target_ev <= 0:
-        return None
+        return None, "unavailable"
 
     def value_at(growth: float) -> Optional[float]:
         enterprise_value, _ = dcf_enterprise_value(
@@ -2237,19 +2353,19 @@ def reverse_dcf(data: StockData, starting_fcff: float, assumptions: MarketAssump
 
     low, high = -0.30, 0.60
     if (value_at(low) or 0) > target_ev:
-        return low
+        return low, "upper_bound"
     if (value_at(high) or 0) < target_ev:
-        return high
+        return high, "lower_bound"
     for _ in range(80):
         mid = (low + high) / 2
         current = value_at(mid)
         if current is None:
-            return None
+            return None, "unavailable"
         if current < target_ev:
             low = mid
         else:
             high = mid
-    return (low + high) / 2
+    return (low + high) / 2, "exact"
 
 
 def normalized_owner_earnings(data: StockData, assumptions: MarketAssumptions) -> tuple[
@@ -2502,9 +2618,10 @@ def estimate_fair_value(
             methods.append(ValuationMethod("DCF (FCFF / WACC)", "cash flow", base, min(bear, base), max(bull, base),
                                            1.0, clamp(reliability), note=note))
 
-        dcf.implied_growth = reverse_dcf(data, starting_fcff, assumptions)
+        dcf.implied_growth, dcf.implied_growth_bound = reverse_dcf(data, starting_fcff, assumptions)
         realized = m.get("revenue_cagr3")
-        if dcf.implied_growth is not None and realized is not None:
+        if (dcf.implied_growth is not None and realized is not None
+                and dcf.implied_growth_bound == "exact"):
             dcf.implied_vs_actual = dcf.implied_growth - realized
 
     # Earnings power value: no growth at all, capitalized in perpetuity. This is
@@ -3114,7 +3231,8 @@ def load_calibration(path: Optional[str]) -> Optional[Calibration]:
 def analyze(data: StockData, peer_symbols: list[str],
             category_weights: Optional[dict[str, float]] = None,
             mos_override: Optional[float] = None,
-            calibration: Optional[Calibration] = None) -> AnalysisResult:
+            calibration: Optional[Calibration] = None,
+            risk_free_override: Optional[float] = None) -> AnalysisResult:
     calibration = calibration or Calibration()
     if category_weights is None:
         category_weights = calibration.category_weights
@@ -3124,13 +3242,17 @@ def analyze(data: StockData, peer_symbols: list[str],
     data.peers_used = peers_used
     data.peer_medians = peer_medians
 
-    risk_free, rate_source = fetch_risk_free_rate(data.warnings)
+    if risk_free_override is None:
+        risk_free, rate_source = fetch_risk_free_rate(data.warnings)
+        live_pe = fetch_live_anchor_pe(data.sector)
+    else:
+        risk_free, rate_source = risk_free_override, "explicit override"
+        live_pe = None
     assumptions = build_assumptions(data, risk_free, rate_source)
 
     confidence = confidence_score(data)
     coverage, freshness = data_quality_components(data)
     integrity = integrity_score(data)
-    live_pe = fetch_live_anchor_pe(data.sector)
     targets = valuation_targets(data, peer_medians, risk_free, live_pe)
     categories = score_categories(data, targets, confidence, integrity,
                                   curve_gammas=calibration.curve_gamma)
@@ -3404,13 +3526,17 @@ def print_report(data: StockData, result: AnalysisResult, detail: str = "standar
                        else "the market is roughly extrapolating recent growth")
         p.key_values((
             ("Implied 5Y cash-flow growth", pct(fv.dcf.implied_growth), "value"),
+            ("Solver result", fv.dcf.implied_growth_bound.replace("_", " "), None),
             ("Realized revenue CAGR 3Y / 5Y", f"{pct(realized3)} / {pct(realized5)}", None),
             ("Implied minus realized", pct(gap) if gap is not None else "N/A",
              "bad" if (gap or 0) > 0.05 else "good"),
             ("Reading", verdict, "neutral"),
         ))
-        p.wrapped("This is the most falsifiable figure in the report: it is the growth rate that makes "
-                  "today's price exactly fair under the stated WACC and terminal growth.", tone="dim")
+        explanation = ("The exact solution lies outside the displayed solver range."
+                       if fv.dcf.implied_growth_bound != "exact"
+                       else "This is the most falsifiable figure in the report: it is the growth rate that makes "
+                            "today's price exactly fair under the stated WACC and terminal growth.")
+        p.wrapped(explanation, tone="dim")
     else:
         p.wrapped("A reverse DCF could not be solved (non-positive or unavailable owner cash flow).", tone="dim")
 
@@ -3636,6 +3762,7 @@ def result_to_dict(data: StockData, result: AnalysisResult) -> dict[str, Any]:
         },
         "reverse_dcf": {
             "implied_growth": fv.dcf.implied_growth,
+            "bound": fv.dcf.implied_growth_bound,
             "realized_revenue_cagr3": data.metrics.get("revenue_cagr3"),
             "realized_revenue_cagr5": data.metrics.get("revenue_cagr5"),
             "implied_minus_realized": fv.dcf.implied_vs_actual,
@@ -3787,9 +3914,21 @@ def run_backtest(path: str, calibrate_out: Optional[str] = None) -> int:
         return 1
 
     frame["excess_return"] = frame["future_return"]
+    return_basis = "absolute return (no benchmark observations supplied)"
     if "benchmark_return" in frame:
         benchmark = pd.to_numeric(frame["benchmark_return"], errors="coerce")
-        frame["excess_return"] = frame["future_return"] - benchmark.fillna(0)
+        matched = benchmark.notna()
+        if matched.any():
+            omitted = int((~matched).sum())
+            if omitted:
+                print(f"Excluded {omitted} row(s) without benchmark returns; absolute and excess returns are never mixed.")
+            frame = frame.loc[matched].copy()
+            benchmark = benchmark.loc[matched]
+            frame["excess_return"] = frame["future_return"] - benchmark
+            return_basis = "benchmark-relative excess return"
+            if len(frame) < 20:
+                print("At least 20 observations with matched benchmark returns are required.")
+                return 1
 
     dates = frame["date"].nunique() if "date" in frame.columns else len(frame)
     tickers = frame["ticker"].nunique() if "ticker" in frame.columns else len(frame)
@@ -3805,6 +3944,7 @@ def run_backtest(path: str, calibrate_out: Optional[str] = None) -> int:
 
     print("\nPOINT-IN-TIME CALIBRATION REPORT")
     print(f"Observations:              {len(frame)}")
+    print(f"Return basis:              {return_basis}")
     print(f"Distinct dates / tickers:  {dates} / {tickers}")
     print(f"Spearman rank correlation: {spearman: .3f}")
     if math.isfinite(lower):
@@ -4066,7 +4206,7 @@ def self_test() -> int:
     check("WACC is between the bounds", MIN_WACC <= assumptions.wacc <= MAX_WACC)
     check("terminal growth is below WACC", assumptions.terminal_growth < assumptions.wacc)
 
-    result = analyze(data, [], None, None)
+    result = analyze(data, [], None, None, risk_free_override=0.042)
     fv = result.fair_value
     check("fair value issued", fv.base is not None, f"(action {fv.action})")
     if fv.base is not None:
@@ -4090,6 +4230,8 @@ def self_test() -> int:
               abs(sum(mt.effective_weight for mt in fv.methods) - 1.0) < 1e-6)
     check("reverse DCF solved", fv.dcf.implied_growth is not None)
     if fv.dcf.implied_growth is not None:
+        check("reverse DCF solution is exact", fv.dcf.implied_growth_bound == "exact",
+              f"(got {fv.dcf.implied_growth_bound})")
         _, parts = dcf_per_share(data, fv.dcf.starting_fcff, fv.dcf.implied_growth, assumptions)
         implied_price = divide(parts.get("equity_value"), data.metrics["effective_shares"])
         check("reverse DCF round-trips to the market price",
@@ -4102,7 +4244,7 @@ def self_test() -> int:
     expensive = _synthetic_company()
     put_metric(expensive, "current_price", 200.0, "market quote", "current", None, 0.98)
     derive_metrics(expensive)
-    expensive_result = analyze(expensive, [], None, None)
+    expensive_result = analyze(expensive, [], None, None, risk_free_override=0.042)
     check("a 10x higher price reads as overvalued",
           "OVER" in expensive_result.fair_value.status or "ABOVE" in expensive_result.fair_value.action,
           f"(got {expensive_result.fair_value.status} / {expensive_result.fair_value.action})")
@@ -4138,8 +4280,8 @@ def self_test() -> int:
           abs(grouped_category(10.0, [("only", 1.0, [1.0])], gamma=1.5).points - 10.0) < 1e-9)
 
     print("\nCalibrated DCF sensitivity bands")
-    wide = analyze(data, [], None, None, Calibration(dcf_band_scale=1.8))
-    narrow = analyze(data, [], None, None, Calibration(dcf_band_scale=0.7))
+    wide = analyze(data, [], None, None, Calibration(dcf_band_scale=1.8), risk_free_override=0.042)
+    narrow = analyze(data, [], None, None, Calibration(dcf_band_scale=0.7), risk_free_override=0.042)
     if None not in (fv.base, wide.fair_value.base, narrow.fair_value.base):
         base_spread = fv.high - fv.low
         check("a band scale above 1 widens bear/bull",
@@ -4260,6 +4402,8 @@ def analyze_symbol(symbol: str, peers: list[str], snapshot_csv: Optional[str],
         else:
             print(f"Unexpected provider or model error: {type(exc).__name__}: {exc}")
             print("The provider may have changed a field name. No rating was fabricated.")
+        if DEBUG_MODE:
+            traceback.print_exc(file=sys.stderr)
     return 1
 
 
@@ -4275,6 +4419,7 @@ def main() -> int:
                                                 "(category weights + curve exponents + DCF band scale)")
     parser.add_argument("--weights-json", help="Apply previously validated category weights (legacy format)")
     parser.add_argument("--calibration-json", help="Apply a validated calibration file from --calibrate-out")
+    parser.add_argument("--config-json", help="Override documented model assumptions and valuation profiles")
     parser.add_argument("--no-secondary", action="store_true",
                         help="Skip Stooq/SEC EDGAR cross-source validation")
     parser.add_argument("--detail", choices=REPORT_DETAILS, default="standard", help="Report depth")
@@ -4283,9 +4428,15 @@ def main() -> int:
     parser.add_argument("--no-cache", action="store_true", help="Bypass the on-disk provider cache")
     parser.add_argument("--clear-cache", action="store_true", help="Delete cached provider data and exit")
     parser.add_argument("--self-test", action="store_true", help="Run offline checks and exit")
+    parser.add_argument("--debug", action="store_true", help="Print tracebacks for unexpected internal errors")
     args = parser.parse_args()
 
-    global CACHE_ENABLED, SECONDARY_ENABLED
+    global CACHE_ENABLED, SECONDARY_ENABLED, DEBUG_MODE
+    DEBUG_MODE = args.debug
+    try:
+        load_model_config(args.config_json)
+    except ConfigurationError as exc:
+        parser.error(str(exc))
     if args.no_cache:
         CACHE_ENABLED = False
     if args.no_secondary:
