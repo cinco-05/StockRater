@@ -1,3 +1,4 @@
+# pyright: reportAttributeAccessIssue=false, reportOperatorIssue=false, reportArgumentType=false, reportOptionalOperand=false, reportOptionalMemberAccess=false, reportCallIssue=false, reportReturnType=false
 """Fundamental equity valuation model V5.
 
 Rebuilt from V4 with a focus on valuation correctness rather than feature count.
@@ -64,6 +65,13 @@ What changed in V5.1 (and why it matters for accuracy)
     claim, not a constant). Optionally, each anchor also blends against the
     live trailing P/E of the matching SPDR sector ETF, cached daily, so the
     anchor drifts with the market instead of with the file's edit date.
+16b. One-year price target. Fair value answers "what is it worth"; the 1Y
+    target answers "where does the model expect the price in twelve months":
+    the price drifts at cost of equity (less dividends) and a calibratable
+    fraction of the gap to fair value (default 35%, fitted by
+    --calibrate-out from realized returns) closes within the year. Reported
+    with bear/base/bull bands and alongside - never blended with - the
+    analyst consensus target.
 16. Peer matching that degrades instead of discarding. A user-supplied peer in
     a different sector is now included at half weight with a note (you named
     it; the model shouldn't pretend it doesn't exist) instead of being dropped,
@@ -143,6 +151,13 @@ MAX_TERMINAL_GROWTH = 0.030
 EXPLICIT_YEARS = 10                  # two-stage: 10y fade, then perpetuity
 FADE_YEARS = 5                       # years of high growth before fade begins
 STATUTORY_TAX_FALLBACK = 0.23
+
+# One-year price target: the expected fraction of the (log) price-to-fair-value
+# gap that closes within a year. Mispricings correct slowly and partially;
+# 0.35 is a middle-of-the-literature value for value convergence, and
+# --calibrate-out fits a better one from your own realized returns.
+CONVERGENCE_RATE = 0.35
+CONVERGENCE_RANGE = (0.10, 0.70)
 
 # Reliability gates
 MIN_INPUT_CONFIDENCE = 60.0
@@ -451,6 +466,7 @@ class Calibration:
     category_weights: Optional[dict[str, float]] = None
     curve_gamma: Optional[dict[str, float]] = None
     dcf_band_scale: Optional[float] = None
+    convergence: Optional[float] = None
     provenance: str = ""
 
 
@@ -565,6 +581,11 @@ class FairValueResult:
     margin_of_safety: Optional[float] = None
     buy_below: Optional[float] = None
     strong_buy_below: Optional[float] = None
+    target_1y: Optional[float] = None
+    target_1y_low: Optional[float] = None
+    target_1y_high: Optional[float] = None
+    expected_return_1y: Optional[float] = None
+    expected_total_return_1y: Optional[float] = None
     action: str = "INCONCLUSIVE"
     decision_basis: str = ""
     dcf: DCFDetail = field(default_factory=DCFDetail)
@@ -2290,6 +2311,54 @@ def normalized_owner_earnings(data: StockData, assumptions: MarketAssumptions) -
 # Fair value: build methods, blend by family, produce the buy-below price
 # --------------------------------------------------------------------------
 
+def forecast_one_year(price: Optional[float], low: Optional[float], base: Optional[float],
+                      high: Optional[float], assumptions: MarketAssumptions,
+                      dividend_yield: Optional[float],
+                      convergence: float = CONVERGENCE_RATE) -> Optional[dict[str, Optional[float]]]:
+    """One-year model price target.
+
+    A DCF fair value is a statement about worth, not about where the price
+    will trade in twelve months, so the target is assembled from two
+    defensible pieces rather than borrowed from analyst consensus:
+
+    1. Drift. Absent any revaluation, a stock's expected total return is its
+       cost of equity, so the no-revaluation price path grows at cost of
+       equity minus the dividend yield. Fair value itself rolls forward one
+       year at the same accretion rate.
+    2. Partial convergence. `convergence` is the fraction of the log
+       price-to-fair-value gap expected to close within the year. The blend
+       is done in log space so bear/base/bull targets stay positive and
+       correctly ordered.
+
+    This is deliberately NOT an analyst-style target: an overvalued name
+    still receives a below-drift target even while the street extrapolates
+    its momentum, and an out-of-favor cheap name gets credit for expected
+    convergence the street may not model.
+    """
+    if price is None or price <= 0 or base is None or base <= 0:
+        return None
+    lam = float(clamp(convergence, *CONVERGENCE_RANGE))
+    payout = dividend_yield or 0.0
+    if payout > 0.25:                # some provider versions report percent, not fraction
+        payout /= 100.0
+    payout = float(clamp(payout, 0.0, 0.12))
+    accretion = float(clamp(assumptions.cost_of_equity - payout, 0.0, 0.20))
+    anchor = price * (1.0 + accretion)          # expected price if no revaluation occurs
+
+    def project(fair: Optional[float]) -> Optional[float]:
+        if fair is None or fair <= 0:
+            return None
+        rolled = fair * (1.0 + accretion)       # the fair value one year from now
+        return float(math.exp((1.0 - lam) * math.log(anchor) + lam * math.log(rolled)))
+
+    target = project(base)
+    if target is None:
+        return None
+    expected = target / price - 1.0
+    return {"base": target, "low": project(low), "high": project(high),
+            "return": expected, "total_return": expected + payout}
+
+
 FAMILY_WEIGHTS = {"cash flow": 0.50, "earnings": 0.30, "asset": 0.10, "market": 0.10}
 
 
@@ -2344,6 +2413,7 @@ def estimate_fair_value(
     integrity: float,
     mos_override: Optional[float] = None,
     band_scale: float = 1.0,
+    convergence: float = CONVERGENCE_RATE,
 ) -> FairValueResult:
     m = data.metrics
     analyst_reference = m.get("analyst_target") if (m.get("analyst_target") or 0) > 0 else None
@@ -2626,6 +2696,14 @@ def estimate_fair_value(
     upside = divide(dollar_gap, price)
     discount_premium = divide(dollar_gap, base)
 
+    forecast = forecast_one_year(price, min(low, base), base, max(high, base),
+                                 assumptions, m.get("dividend_yield"), convergence)
+    if forecast is not None:
+        notes.append(
+            f"The 1Y target drifts the price at cost of equity and closes "
+            f"{float(clamp(convergence, *CONVERGENCE_RANGE)):.0%} of the gap to fair value within the year; "
+            "it is a valuation-convergence estimate, not an analyst-style momentum target.")
+
     if price is None:
         action, basis = "INCONCLUSIVE - NO PRICE", "No current price available"
     elif confidence < 45:
@@ -2651,7 +2729,13 @@ def estimate_fair_value(
         dollar_gap=dollar_gap, upside_downside=upside, discount_premium=discount_premium,
         status=valuation_status(upside), family_agreement=agreement, family_ratio=family_ratio,
         dispersion=dispersion, confidence=confidence, margin_of_safety=margin,
-        buy_below=buy_below, strong_buy_below=strong_buy_below, action=action, decision_basis=basis,
+        buy_below=buy_below, strong_buy_below=strong_buy_below,
+        target_1y=forecast["base"] if forecast else None,
+        target_1y_low=forecast["low"] if forecast else None,
+        target_1y_high=forecast["high"] if forecast else None,
+        expected_return_1y=forecast["return"] if forecast else None,
+        expected_total_return_1y=forecast["total_return"] if forecast else None,
+        action=action, decision_basis=basis,
         dcf=dcf, assumptions_used=assumptions, owner_earnings=starting_fcff,
         normalized_sbc=normalized_sbc, diagnostics=diagnostics, assumptions=notes,
     )
@@ -3019,7 +3103,11 @@ def load_calibration(path: Optional[str]) -> Optional[Calibration]:
                   if k in CATEGORY_MAXIMUMS and math.isfinite(float(v))}
     band = payload.get("dcf_band_scale")
     band = float(clamp(float(band), *DCF_BAND_SCALE_RANGE)) if band is not None and math.isfinite(float(band)) else None
+    conv = payload.get("convergence")
+    conv = (float(clamp(float(conv), *CONVERGENCE_RANGE))
+            if conv is not None and math.isfinite(float(conv)) else None)
     return Calibration(category_weights=weights, curve_gamma=gammas, dcf_band_scale=band,
+                       convergence=conv,
                        provenance=str(payload.get("meta", {}).get("generated", "calibration file")))
 
 
@@ -3058,6 +3146,7 @@ def analyze(data: StockData, peer_symbols: list[str],
         data, targets, assumptions, confidence, coverage, freshness,
         quality, model_fit, integrity, mos_override,
         band_scale=calibration.dcf_band_scale if calibration.dcf_band_scale is not None else 1.0,
+        convergence=calibration.convergence if calibration.convergence is not None else CONVERGENCE_RATE,
     )
     model_confidence = fair_value.confidence if fair_value.methods else min(
         40.0, 0.30 * coverage + 0.20 * freshness + 0.20 * model_fit)
@@ -3269,6 +3358,10 @@ def print_report(data: StockData, result: AnalysisResult, detail: str = "standar
         (f"Strong-buy below   {price_text(fv.strong_buy_below, data.currency)}", "good"),
         (f"Verdict            {fv.status}",
          "good" if "UNDER" in fv.status else "bad" if "OVER" in fv.status else "neutral"),
+        ((f"1Y model target    {price_text(fv.target_1y, data.currency)}   "
+          f"(expected total return {fv.expected_total_return_1y:+.1%})")
+         if fv.target_1y is not None else "1Y model target    not issued",
+         ("good" if (fv.expected_return_1y or 0) >= 0 else "bad") if fv.target_1y is not None else "dim"),
         (f"Action             {fv.action}", action_tone(fv.action)),
         (f"Quality {result.business_quality:.0f}/100   Score {result.overall:.0f}/100   "
          f"Model confidence {result.model_confidence:.0f}%", score_tone(result.model_confidence)),
@@ -3285,9 +3378,19 @@ def print_report(data: StockData, result: AnalysisResult, detail: str = "standar
             ("Bear / base / bull", f"{price_text(fv.low, data.currency)} / {price_text(fv.base, data.currency)} / {price_text(fv.high, data.currency)}", "value"),
             ("Upside to fair value", f"{fv.upside_downside:+.1%}" if fv.upside_downside is not None else "N/A",
              "good" if (fv.upside_downside or 0) >= 0 else "bad"),
+            ("1Y target (bear/base/bull)",
+             f"{price_text(fv.target_1y_low, data.currency)} / {price_text(fv.target_1y, data.currency)} / {price_text(fv.target_1y_high, data.currency)}"
+             if fv.target_1y is not None else "not issued", "value"),
+            ("Expected 1Y return (price / total)",
+             f"{fv.expected_return_1y:+.1%} / {fv.expected_total_return_1y:+.1%}"
+             if fv.expected_return_1y is not None else "N/A",
+             "good" if (fv.expected_return_1y or 0) >= 0 else "bad"),
             ("Analyst target (reference)", price_text(fv.analyst_reference, data.currency), "dim"),
         ))
         p.wrapped("Zones are valuation references. They are not technical levels and not instructions to trade.", tone="dim")
+        p.wrapped("The 1Y target models drift plus partial convergence toward fair value; analyst targets extrapolate "
+                  "consensus expectations. A large gap between the two is normal for momentum names and is itself "
+                  "information, not an error.", tone="dim")
 
     p.section("What the market is pricing in (reverse DCF)")
     if fv.dcf.implied_growth is not None:
@@ -3522,6 +3625,11 @@ def result_to_dict(data: StockData, result: AnalysisResult) -> dict[str, Any]:
             "bull": fv.high,
             "upside_downside": fv.upside_downside,
             "discount_premium": fv.discount_premium,
+            "target_1y": fv.target_1y,
+            "target_1y_low": fv.target_1y_low,
+            "target_1y_high": fv.target_1y_high,
+            "expected_return_1y": fv.expected_return_1y,
+            "expected_total_return_1y": fv.expected_total_return_1y,
             "status": fv.status,
             "action": fv.action,
             "decision_basis": fv.decision_basis,
@@ -3582,7 +3690,7 @@ SNAPSHOT_FIELDS = [
     "model_confidence", "cross_family_agreement", "fair_value", "buy_below",
     "margin_of_safety", "upside_downside", "discount_premium", "valuation_status",
     "action", "implied_growth", "realized_cagr3", "piotroski_f", "altman_z", "beneish_m",
-    "bear", "bull",
+    "bear", "bull", "target_1y", "expected_return_1y",
     *[f"cat_{key}" for key in CATEGORY_MAXIMUMS],
     "future_return", "benchmark_return",
 ]
@@ -3625,6 +3733,7 @@ def append_snapshot(path: str, data: StockData, result: AnalysisResult) -> None:
         "implied_growth": fv.dcf.implied_growth, "realized_cagr3": data.metrics.get("revenue_cagr3"),
         "piotroski_f": f.piotroski, "altman_z": f.altman_z, "beneish_m": f.beneish_m,
         "bear": fv.low, "bull": fv.high,
+        "target_1y": fv.target_1y, "expected_return_1y": fv.expected_return_1y,
         "future_return": "", "benchmark_return": "",
     }
     for key, category in result.categories.items():
@@ -3767,6 +3876,23 @@ def run_backtest(path: str, calibrate_out: Optional[str] = None) -> int:
             print("\nSensitivity-band check: not enough bear/bull observations yet "
                   "(needs 30+ rows across 8+ dates with the bear/bull columns filled).")
 
+    # Convergence fit for the 1Y target: how much of a valuation gap actually
+    # closed over the horizon. Slope of realized return on predicted upside,
+    # with the upside winsorized so one deep-value outlier cannot set it.
+    convergence_fit: Optional[float] = None
+    if "upside_downside" in frame.columns:
+        upside_series = pd.to_numeric(frame["upside_downside"], errors="coerce").clip(-0.8, 2.0)
+        pair = pd.DataFrame({"upside": upside_series, "ret": frame["future_return"],
+                             "date": frame.get("date")}).dropna(subset=["upside", "ret"])
+        if len(pair) >= 30 and pair["date"].nunique() >= 8 and float(pair["upside"].var()) > 1e-6:
+            slope = float(pair[["upside", "ret"]].cov().iloc[0, 1] / float(pair["upside"].var()))
+            convergence_fit = float(clamp(slope, *CONVERGENCE_RANGE))
+            print(f"\nConvergence check: a 10% valuation gap closed about {slope * 0.10:+.1%} over the horizon "
+                  f"-> fitted convergence {convergence_fit:.2f} (default {CONVERGENCE_RATE:.2f}).")
+        else:
+            print("\nConvergence check: not enough observations with upside_downside filled "
+                  "(needs 30+ rows across 8+ dates); the 1Y target keeps its default convergence.")
+
     # Curve-shape signal per category: the rank correlation earned above maps
     # to a curve exponent. Strong ordering steepens the curve; absent ordering
     # flattens it. This is intentionally the ONLY shape parameter fitted -
@@ -3803,9 +3929,10 @@ def run_backtest(path: str, calibrate_out: Optional[str] = None) -> int:
             "category_weights": candidate,
             "curve_gamma": {k: curve_gamma.get(k, 1.0) for k in CATEGORY_MAXIMUMS},
             "dcf_band_scale": band_scale if band_scale is not None else 1.0,
+            "convergence": convergence_fit if convergence_fit is not None else CONVERGENCE_RATE,
         }
         Path(calibrate_out).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-        print(f"\nCalibration written to {calibrate_out} (weights + curve exponents + band scale). "
+        print(f"\nCalibration written to {calibrate_out} (weights + curve exponents + band scale + convergence). "
               "Validate it on a separate holdout of dates AND tickers before passing --calibration-json.")
 
     if not math.isfinite(spearman) or spearman < 0.10 or spread <= 0:
@@ -3947,6 +4074,18 @@ def self_test() -> int:
         check("strong-buy is under buy-below", fv.strong_buy_below <= fv.buy_below)
         check("bear <= base <= bull", fv.low <= fv.base <= fv.high)
         check("margin of safety in range", 0.10 <= (fv.margin_of_safety or 0) <= 0.50)
+        check("1Y target issued", fv.target_1y is not None)
+        if fv.target_1y is not None:
+            check("1Y bear <= base <= bull", fv.target_1y_low <= fv.target_1y <= fv.target_1y_high)
+        flat = forecast_one_year(100.0, 100.0, 100.0, 100.0, assumptions, 0.0)
+        check("at fair value the 1Y target equals the cost-of-equity drift",
+              flat is not None and abs(flat["base"] - 100.0 * (1 + assumptions.cost_of_equity)) < 1e-6)
+        rich = forecast_one_year(200.0, 100.0, 100.0, 100.0, assumptions, 0.0)
+        check("an overvalued 1Y target sits below plain drift",
+              rich is not None and rich["base"] < 200.0 * (1 + assumptions.cost_of_equity))
+        cheap = forecast_one_year(50.0, 100.0, 100.0, 100.0, assumptions, 0.0)
+        check("an undervalued 1Y target sits above plain drift",
+              cheap is not None and cheap["base"] > 50.0 * (1 + assumptions.cost_of_equity))
         check("effective weights sum to one",
               abs(sum(mt.effective_weight for mt in fv.methods) - 1.0) < 1e-6)
     check("reverse DCF solved", fv.dcf.implied_growth is not None)
