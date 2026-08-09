@@ -96,7 +96,7 @@ Evaluate completed observations:
 python stock_analyzer.py --backtest-csv history.csv
 ```
 
-Use `--calibrate-out weights.json` with a backtest to generate candidate category weights, then apply validated weights with `--weights-json weights.json`.
+Use `--calibrate-out calibration.json` with a backtest to generate a full calibration file, then apply a validated file with `--calibration-json calibration.json`.
 
 ## Data and cache
 
@@ -104,8 +104,8 @@ Live data is provided through `yfinance`. Responses are cached in the operating 
 
 The following environment variables customize cache behavior:
 
-- `SAV6_CACHE`: cache directory
-- `SAV6_CACHE_TTL`: cache lifetime in seconds
+- `SAV5_CACHE`: cache directory
+- `SAV5_CACHE_TTL`: cache lifetime in seconds
 
 Incompatible or corrupt cache entries are automatically invalidated.
 
