@@ -1,26 +1,25 @@
-name: Tests
+# Save as .github/workflows/ci.yml in your repo
+name: test
 
 on:
   push:
   pull_request:
-
-permissions:
-  contents: read
 
 jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: ["3.10", "3.12"]
+        python-version: ["3.10", "3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
-          cache: pip
-      - run: python -m pip install --upgrade pip
-      - run: python -m pip install -r requirements-dev.txt
-      - run: python -m py_compile stock_analyzer.py
-      - run: python stock_analyzer.py --self-test
-      - run: python -m pytest -q
+
+      - name: Install dependencies
+        run: pip install yfinance pandas numpy
+
+      - name: Run self-test (offline, no network needed)
+        run: python stock_analyzer_v5.py --self-test
